@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RAG Evaluation Platform &middot; Dashboard</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ============ Top bar ============ -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">&#9632;</span>
+      <div class="brand-text">
+        <h1>RAG Evaluation Platform</h1>
+        <p class="brand-sub">Retrieval &amp; generation quality, benchmarked</p>
+      </div>
+    </div>
+
+    <div class="topbar-right">
+      <label class="api-base">
+        <span>API</span>
+        <input id="apiBaseInput" type="text" spellcheck="false" value="http://127.0.0.1:8000">
+      </label>
+      <div id="apiStatus" class="status-pill status-pending">
+        <span class="dot"></span>
+        <span class="status-label">connecting&hellip;</span>
+      </div>
+      <button id="refreshBtn" class="btn btn-ghost" title="Refresh now">
+        <svg viewBox="0 0 24 24" width="15" height="15"><path fill="currentColor" d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 0 0 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>
+        Refresh
+      </button>
+      <label class="auto-refresh">
+        <input id="autoRefresh" type="checkbox" checked>
+        Auto
+      </label>
+    </div>
+  </header>
+
+  <main class="content">
+
+    <!-- ============ Overview stat rail ============ -->
+    <section class="stat-rail" aria-label="Overview">
+      <div class="stat-card">
+        <span class="stat-label">Projects</span>
+        <span class="stat-value" id="statProjects">&mdash;</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Datasets</span>
+        <span class="stat-value" id="statDatasets">&mdash;</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Experiments</span>
+        <span class="stat-value" id="statExperiments">&mdash;</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Benchmarks</span>
+        <span class="stat-value" id="statBenchmarks">&mdash;</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Evaluations</span>
+        <span class="stat-value" id="statEvaluations">&mdash;</span>
+      </div>
+      <div class="stat-card stat-card--accent">
+        <span class="stat-label">Average Score</span>
+        <span class="stat-value" id="statAverage">&mdash;</span>
+      </div>
+    </section>
+
+    <div class="grid-2">
+
+      <!-- ============ Leaderboard ============ -->
+      <section class="panel panel--leaderboard">
+        <div class="panel-head">
+          <h2>Leaderboard</h2>
+          <span class="panel-sub">Ranked by overall average score</span>
+        </div>
+
+        <div class="table-wrap">
+          <table class="data-table" id="leaderboardTable">
+            <thead>
+              <tr>
+                <th>Rank</th>
+                <th>Experiment</th>
+                <th>Benchmark</th>
+                <th>Status</th>
+                <th>Evals</th>
+                <th>Score</th>
+              </tr>
+            </thead>
+            <tbody id="leaderboardBody">
+              <tr class="empty-row"><td colspan="6">Waiting for data&hellip;</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ============ Terminal feed (signature element) ============ -->
+      <section class="panel panel--terminal">
+        <div class="panel-head">
+          <h2>Pipeline Run</h2>
+          <span class="panel-sub">python scripts/run_evaluation.py</span>
+        </div>
+        <div class="terminal" id="terminalFeed">
+          <div class="terminal-line dim">$ python scripts/run_evaluation.py</div>
+          <div class="terminal-line dim">Waiting for the latest run&hellip;</div>
+        </div>
+      </section>
+
+    </div>
+
+    <div class="grid-2">
+
+      <!-- ============ Run comparison ============ -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Run Comparison</h2>
+          <span class="panel-sub">Overall score across every benchmark run</span>
+        </div>
+        <div class="chart-box">
+          <canvas id="comparisonChart"></canvas>
+        </div>
+      </section>
+
+      <!-- ============ Metric breakdown ============ -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Metric Breakdown</h2>
+          <div class="legend">
+            <span><i class="dot dot--retrieval"></i>Retrieval</span>
+            <span><i class="dot dot--generation"></i>Generation</span>
+            <span><i class="dot dot--judge"></i>LLM Judge</span>
+          </div>
+        </div>
+        <div class="chart-box">
+          <canvas id="metricChart"></canvas>
+        </div>
+      </section>
+
+    </div>
+
+    <!-- ============ Benchmark detail / drill-down ============ -->
+    <section class="panel panel--detail">
+      <div class="panel-head panel-head--wrap">
+        <div>
+          <h2>Benchmark Detail</h2>
+          <span class="panel-sub">Inspect one run, compare metrics, download reports</span>
+        </div>
+        <div class="detail-controls">
+          <select id="benchmarkSelect"></select>
+          <a id="downloadJson" class="btn btn-outline" href="#" target="_blank">JSON</a>
+          <a id="downloadCsv" class="btn btn-outline" href="#" target="_blank">CSV</a>
+          <a id="downloadMd" class="btn btn-outline" href="#" target="_blank">Markdown</a>
+        </div>
+      </div>
+
+      <div class="detail-grid">
+        <div class="chart-box chart-box--small">
+          <canvas id="detailChart"></canvas>
+        </div>
+
+        <div class="table-wrap table-wrap--scroll">
+          <table class="data-table data-table--compact" id="samplesTable">
+            <thead>
+              <tr>
+                <th>Question</th>
+                <th>Answer</th>
+                <th>Faithfulness</th>
+                <th>Correctness</th>
+                <th>Semantic&nbsp;Sim.</th>
+              </tr>
+            </thead>
+            <tbody id="samplesBody">
+              <tr class="empty-row"><td colspan="5">Select a benchmark above.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="app-footer">
+    <span>RAG Evaluation Platform</span>
+    <span class="dim" id="lastUpdated">never updated</span>
+  </footer>
+
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

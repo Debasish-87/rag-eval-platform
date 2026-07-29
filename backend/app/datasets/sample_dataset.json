@@ -1,0 +1,482 @@
+[
+  {
+    "question": "Who created the Python programming language?",
+    "contexts": [
+      "Python was created by Guido van Rossum and first released in 1991.",
+      "JavaScript was created by Brendan Eich in 1995.",
+      "The Java programming language was released by Sun Microsystems in 1995."
+    ],
+    "relevant_contexts": [
+      "Python was created by Guido van Rossum and first released in 1991."
+    ],
+    "answer": "Python was created by Guido van Rossum.",
+    "ground_truth": "Python was created by Guido van Rossum.",
+    "metadata": {
+      "topic": "python"
+    }
+  },
+  {
+    "question": "What does the Python 'GIL' stand for?",
+    "contexts": [
+      "The GIL, or Global Interpreter Lock, allows only one thread to execute Python bytecode at a time in CPython.",
+      "Python's garbage collector uses reference counting alongside a generational collector.",
+      "PEP 8 is the official style guide for Python code."
+    ],
+    "relevant_contexts": [
+      "The GIL, or Global Interpreter Lock, allows only one thread to execute Python bytecode at a time in CPython."
+    ],
+    "answer": "GIL stands for Global Interpreter Lock.",
+    "ground_truth": "GIL stands for Global Interpreter Lock.",
+    "metadata": {
+      "topic": "python"
+    }
+  },
+  {
+    "question": "What is a Python list comprehension used for?",
+    "contexts": [
+      "A list comprehension provides a concise way to create lists by applying an expression to each item in an iterable.",
+      "Python dictionaries store key-value pairs and are unordered prior to 3.7.",
+      "Python's `with` statement is used for resource management via context managers."
+    ],
+    "relevant_contexts": [
+      "A list comprehension provides a concise way to create lists by applying an expression to each item in an iterable."
+    ],
+    "answer": "It provides a concise syntax for creating a new list from an existing iterable.",
+    "ground_truth": "It provides a concise syntax for creating a new list from an existing iterable.",
+    "metadata": {
+      "topic": "python"
+    }
+  },
+  {
+    "question": "What is the difference between a Python list and a tuple?",
+    "contexts": [
+      "Lists are mutable and defined with square brackets, while tuples are immutable and defined with parentheses.",
+      "Sets are unordered collections of unique elements in Python.",
+      "Python dictionaries were made ordered by insertion starting with Python 3.7."
+    ],
+    "relevant_contexts": [
+      "Lists are mutable and defined with square brackets, while tuples are immutable and defined with parentheses."
+    ],
+    "answer": "Lists are mutable; tuples are immutable. It was also standardized as part of the official specification in the early releases.",
+    "ground_truth": "Lists are mutable; tuples are immutable.",
+    "metadata": {
+      "topic": "python"
+    }
+  },
+  {
+    "question": "What command creates a new branch in Git?",
+    "contexts": [
+      "`git branch <name>` creates a new branch, and `git checkout -b <name>` creates and switches to it.",
+      "`git commit` records changes to the local repository.",
+      "`git clone` copies a remote repository to your local machine."
+    ],
+    "relevant_contexts": [
+      "`git branch <name>` creates a new branch, and `git checkout -b <name>` creates and switches to it."
+    ],
+    "answer": "`git branch <name>` (or `git checkout -b <name>` to create and switch).",
+    "ground_truth": "`git branch <name>` (or `git checkout -b <name>` to create and switch).",
+    "metadata": {
+      "topic": "git"
+    }
+  },
+  {
+    "question": "What does 'git rebase' do?",
+    "contexts": [
+      "Git rebase reapplies commits from one branch on top of another base commit, producing a linear history.",
+      "`git merge` combines the histories of two branches, creating a merge commit.",
+      "`git stash` temporarily shelves uncommitted changes."
+    ],
+    "relevant_contexts": [
+      "Git rebase reapplies commits from one branch on top of another base commit, producing a linear history."
+    ],
+    "answer": "It reapplies commits on top of another base, creating a linear history.",
+    "ground_truth": "It reapplies commits on top of another base, creating a linear history.",
+    "metadata": {
+      "topic": "git"
+    }
+  },
+  {
+    "question": "What is a Git merge conflict?",
+    "contexts": [
+      "A merge conflict occurs when Git cannot automatically reconcile differences between two commits because the same lines were changed differently.",
+      "A detached HEAD state occurs when you check out a specific commit instead of a branch.",
+      "`.gitignore` lists files and directories Git should not track."
+    ],
+    "relevant_contexts": [
+      "A merge conflict occurs when Git cannot automatically reconcile differences between two commits because the same lines were changed differently."
+    ],
+    "answer": "A merge conflict means the repository has been permanently corrupted and must be recreated.",
+    "ground_truth": "It happens when Git can't automatically reconcile differing changes to the same lines and needs manual resolution.",
+    "metadata": {
+      "topic": "git"
+    }
+  },
+  {
+    "question": "What is the purpose of a Dockerfile?",
+    "contexts": [
+      "A Dockerfile is a text file containing instructions to build a Docker image, such as base image, dependencies, and startup command.",
+      "Docker Compose defines and runs multi-container applications using a YAML file.",
+      "A Docker volume persists data outside a container's writable layer."
+    ],
+    "relevant_contexts": [
+      "A Dockerfile is a text file containing instructions to build a Docker image, such as base image, dependencies, and startup command."
+    ],
+    "answer": "It defines the instructions used to build a Docker image.",
+    "ground_truth": "It defines the instructions used to build a Docker image.",
+    "metadata": {
+      "topic": "docker"
+    }
+  },
+  {
+    "question": "What does 'docker-compose up' do?",
+    "contexts": [
+      "`docker-compose up` builds, (re)creates, and starts all the services defined in a docker-compose.yml file.",
+      "`docker ps` lists currently running containers.",
+      "`docker exec` runs a command inside a running container."
+    ],
+    "relevant_contexts": [
+      "`docker-compose up` builds, (re)creates, and starts all the services defined in a docker-compose.yml file."
+    ],
+    "answer": "It builds and starts all services defined in docker-compose.yml.",
+    "ground_truth": "It builds and starts all services defined in docker-compose.yml.",
+    "metadata": {
+      "topic": "docker"
+    }
+  },
+  {
+    "question": "What is the difference between a Docker image and a container?",
+    "contexts": [
+      "An image is an immutable, read-only template; a container is a running (or stopped) instance of that image.",
+      "Kubernetes orchestrates containers across a cluster of machines.",
+      "A container registry, like Docker Hub, stores and distributes images."
+    ],
+    "relevant_contexts": [
+      "An image is an immutable, read-only template; a container is a running (or stopped) instance of that image."
+    ],
+    "answer": "An image is a read-only template; a container is a running instance of an image.",
+    "ground_truth": "An image is a read-only template; a container is a running instance of an image.",
+    "metadata": {
+      "topic": "docker"
+    }
+  },
+  {
+    "question": "What does the SQL 'JOIN' clause do?",
+    "contexts": [
+      "A JOIN clause combines rows from two or more tables based on a related column between them.",
+      "The `GROUP BY` clause groups rows sharing a value into summary rows.",
+      "An index speeds up data retrieval at the cost of extra storage and write overhead."
+    ],
+    "relevant_contexts": [
+      "A JOIN clause combines rows from two or more tables based on a related column between them."
+    ],
+    "answer": "It combines rows from two or more tables based on a related column.",
+    "ground_truth": "It combines rows from two or more tables based on a related column.",
+    "metadata": {
+      "topic": "sql"
+    }
+  },
+  {
+    "question": "What is the difference between 'WHERE' and 'HAVING' in SQL?",
+    "contexts": [
+      "WHERE filters rows before grouping/aggregation, while HAVING filters groups after aggregation.",
+      "A primary key uniquely identifies each row in a table.",
+      "A foreign key enforces a link between data in two tables."
+    ],
+    "relevant_contexts": [
+      "WHERE filters rows before grouping/aggregation, while HAVING filters groups after aggregation."
+    ],
+    "answer": "WHERE filters rows before aggregation; HAVING filters aggregated groups. It was also standardized as part of the official specification in the early releases.",
+    "ground_truth": "WHERE filters rows before aggregation; HAVING filters aggregated groups.",
+    "metadata": {
+      "topic": "sql"
+    }
+  },
+  {
+    "question": "What is database normalization?",
+    "contexts": [
+      "Normalization is the process of organizing tables to reduce data redundancy and improve data integrity, typically via normal forms.",
+      "A transaction is a unit of work that is executed atomically.",
+      "A view is a virtual table based on the result of a stored SQL query."
+    ],
+    "relevant_contexts": [
+      "Normalization is the process of organizing tables to reduce data redundancy and improve data integrity, typically via normal forms."
+    ],
+    "answer": "It's the process of structuring tables to reduce redundancy and improve data integrity.",
+    "ground_truth": "It's the process of structuring tables to reduce redundancy and improve data integrity.",
+    "metadata": {
+      "topic": "sql"
+    }
+  },
+  {
+    "question": "What HTTP status code indicates a successful request?",
+    "contexts": [
+      "HTTP status code 200 (OK) indicates that the request succeeded.",
+      "HTTP 404 means the requested resource was not found.",
+      "HTTP 500 indicates an internal server error."
+    ],
+    "relevant_contexts": [
+      "HTTP status code 200 (OK) indicates that the request succeeded."
+    ],
+    "answer": "200 OK.",
+    "ground_truth": "200 OK.",
+    "metadata": {
+      "topic": "http"
+    }
+  },
+  {
+    "question": "What is the difference between HTTP PUT and PATCH?",
+    "contexts": [
+      "PUT replaces an entire resource, while PATCH applies a partial update to it.",
+      "HTTP GET requests should be safe and not modify server state.",
+      "CORS controls which origins are permitted to access a resource via HTTP headers."
+    ],
+    "relevant_contexts": [
+      "PUT replaces an entire resource, while PATCH applies a partial update to it."
+    ],
+    "answer": "PUT replaces the whole resource; PATCH partially updates it.",
+    "ground_truth": "PUT replaces the whole resource; PATCH partially updates it.",
+    "metadata": {
+      "topic": "http"
+    }
+  },
+  {
+    "question": "What does the HTTP 'Authorization' header do?",
+    "contexts": [
+      "The Authorization header carries credentials, such as a bearer token, used to authenticate a request.",
+      "The `Content-Type` header indicates the media type of the request or response body.",
+      "The `Cache-Control` header specifies caching directives for browsers and proxies."
+    ],
+    "relevant_contexts": [
+      "The Authorization header carries credentials, such as a bearer token, used to authenticate a request."
+    ],
+    "answer": "The Authorization header specifies which file formats the server can compress in its response.",
+    "ground_truth": "It carries credentials (e.g. a bearer token) used to authenticate the request.",
+    "metadata": {
+      "topic": "http"
+    }
+  },
+  {
+    "question": "What is overfitting in machine learning?",
+    "contexts": [
+      "Overfitting occurs when a model learns the training data too closely, including its noise, and performs poorly on unseen data.",
+      "Regularization adds a penalty term to reduce model complexity.",
+      "Cross-validation estimates how a model generalizes to an independent dataset."
+    ],
+    "relevant_contexts": [
+      "Overfitting occurs when a model learns the training data too closely, including its noise, and performs poorly on unseen data."
+    ],
+    "answer": "It's when a model fits the training data (including noise) so closely that it generalizes poorly to new data.",
+    "ground_truth": "It's when a model fits the training data (including noise) so closely that it generalizes poorly to new data.",
+    "metadata": {
+      "topic": "ml"
+    }
+  },
+  {
+    "question": "What is the purpose of a validation set?",
+    "contexts": [
+      "A validation set is used to tune hyperparameters and evaluate a model during training, separate from the final test set.",
+      "The test set gives an unbiased estimate of final model performance.",
+      "Data augmentation artificially expands a training set with transformed examples."
+    ],
+    "relevant_contexts": [
+      "A validation set is used to tune hyperparameters and evaluate a model during training, separate from the final test set."
+    ],
+    "answer": "It's used to tune hyperparameters and monitor training, separately from the test set.",
+    "ground_truth": "It's used to tune hyperparameters and monitor training, separately from the test set.",
+    "metadata": {
+      "topic": "ml"
+    }
+  },
+  {
+    "question": "What is gradient descent?",
+    "contexts": [
+      "Gradient descent is an optimization algorithm that iteratively adjusts parameters in the direction that minimizes a loss function.",
+      "Batch normalization stabilizes and speeds up training by normalizing layer inputs.",
+      "A learning rate controls the step size of each optimization update."
+    ],
+    "relevant_contexts": [
+      "Gradient descent is an optimization algorithm that iteratively adjusts parameters in the direction that minimizes a loss function."
+    ],
+    "answer": "An iterative optimization algorithm that adjusts parameters to minimize a loss function.",
+    "ground_truth": "An iterative optimization algorithm that adjusts parameters to minimize a loss function.",
+    "metadata": {
+      "topic": "ml"
+    }
+  },
+  {
+    "question": "What does RAG stand for in the context of LLM applications?",
+    "contexts": [
+      "RAG stands for Retrieval-Augmented Generation, a technique that retrieves relevant documents to ground an LLM's generated answer.",
+      "Fine-tuning adapts a pretrained model's weights on a task-specific dataset.",
+      "Prompt engineering designs input prompts to steer an LLM's output."
+    ],
+    "relevant_contexts": [
+      "RAG stands for Retrieval-Augmented Generation, a technique that retrieves relevant documents to ground an LLM's generated answer."
+    ],
+    "answer": "Retrieval-Augmented Generation.",
+    "ground_truth": "Retrieval-Augmented Generation.",
+    "metadata": {
+      "topic": "rag"
+    }
+  },
+  {
+    "question": "Why is retrieval evaluation important in a RAG system?",
+    "contexts": [
+      "If the retriever returns irrelevant documents, the generator has no reliable grounding, so retrieval quality directly bounds answer quality.",
+      "Vector databases index embeddings for efficient approximate nearest-neighbor search.",
+      "Chunking splits documents into smaller passages before embedding and indexing."
+    ],
+    "relevant_contexts": [
+      "If the retriever returns irrelevant documents, the generator has no reliable grounding, so retrieval quality directly bounds answer quality."
+    ],
+    "answer": "Because generation quality is bounded by retrieval quality, poor retrieval limits how good the final answer can be.",
+    "ground_truth": "Because generation quality is bounded by retrieval quality, poor retrieval limits how good the final answer can be.",
+    "metadata": {
+      "topic": "rag"
+    }
+  },
+  {
+    "question": "What does the 'faithfulness' metric measure in RAG evaluation?",
+    "contexts": [
+      "Faithfulness measures whether the generated answer is factually supported by the retrieved context, without unsupported claims.",
+      "Answer relevance measures how well the answer addresses the original question.",
+      "Context precision measures how much of the retrieved context is actually relevant."
+    ],
+    "relevant_contexts": [
+      "Faithfulness measures whether the generated answer is factually supported by the retrieved context, without unsupported claims."
+    ],
+    "answer": "Whether the answer's claims are supported by the retrieved context. It was also standardized as part of the official specification in the early releases.",
+    "ground_truth": "Whether the answer's claims are supported by the retrieved context.",
+    "metadata": {
+      "topic": "rag"
+    }
+  },
+  {
+    "question": "What is the difference between Precision@K and Recall@K in retrieval evaluation?",
+    "contexts": [
+      "Precision@K measures the fraction of the top-K retrieved documents that are relevant, while Recall@K measures the fraction of all relevant documents captured in the top-K.",
+      "Mean Reciprocal Rank (MRR) rewards ranking the first relevant document higher.",
+      "NDCG accounts for both relevance and rank position of retrieved documents."
+    ],
+    "relevant_contexts": [
+      "Precision@K measures the fraction of the top-K retrieved documents that are relevant, while Recall@K measures the fraction of all relevant documents captured in the top-K."
+    ],
+    "answer": "Precision@K is the share of the top-K results that are relevant; Recall@K is the share of all relevant documents found in the top-K.",
+    "ground_truth": "Precision@K is the share of the top-K results that are relevant; Recall@K is the share of all relevant documents found in the top-K.",
+    "metadata": {
+      "topic": "rag"
+    }
+  },
+  {
+    "question": "What does the Linux command 'chmod 755' do?",
+    "contexts": [
+      "`chmod 755` gives the owner read, write, and execute permissions, while group and others get read and execute only.",
+      "`chown` changes the owner and group of a file.",
+      "`ls -l` lists files with detailed permission and metadata information."
+    ],
+    "relevant_contexts": [
+      "`chmod 755` gives the owner read, write, and execute permissions, while group and others get read and execute only."
+    ],
+    "answer": "It sets owner permissions to read/write/execute and group/others to read/execute.",
+    "ground_truth": "It sets owner permissions to read/write/execute and group/others to read/execute.",
+    "metadata": {
+      "topic": "linux"
+    }
+  },
+  {
+    "question": "What is a Linux symbolic link?",
+    "contexts": [
+      "A symbolic link is a special file that points to another file or directory by path, similar to a shortcut.",
+      "A hard link points directly to the same inode as the original file.",
+      "`grep` searches text using patterns, including regular expressions."
+    ],
+    "relevant_contexts": [
+      "A symbolic link is a special file that points to another file or directory by path, similar to a shortcut."
+    ],
+    "answer": "A file that points to another file or directory by path, like a shortcut.",
+    "ground_truth": "A file that points to another file or directory by path, like a shortcut.",
+    "metadata": {
+      "topic": "linux"
+    }
+  },
+  {
+    "question": "What is the purpose of DNS?",
+    "contexts": [
+      "DNS (Domain Name System) translates human-readable domain names into IP addresses that computers use to route traffic.",
+      "A CDN caches and serves content from edge locations close to users.",
+      "TLS encrypts data in transit between a client and server."
+    ],
+    "relevant_contexts": [
+      "DNS (Domain Name System) translates human-readable domain names into IP addresses that computers use to route traffic."
+    ],
+    "answer": "It translates domain names into IP addresses.",
+    "ground_truth": "It translates domain names into IP addresses.",
+    "metadata": {
+      "topic": "networking"
+    }
+  },
+  {
+    "question": "What is the difference between TCP and UDP?",
+    "contexts": [
+      "TCP is connection-oriented and guarantees ordered, reliable delivery, while UDP is connectionless and doesn't guarantee delivery or order.",
+      "HTTP/2 multiplexes multiple requests over a single TCP connection.",
+      "A firewall filters network traffic based on defined security rules."
+    ],
+    "relevant_contexts": [
+      "TCP is connection-oriented and guarantees ordered, reliable delivery, while UDP is connectionless and doesn't guarantee delivery or order."
+    ],
+    "answer": "TCP is reliable and connection-oriented; UDP is connectionless and doesn't guarantee delivery.",
+    "ground_truth": "TCP is reliable and connection-oriented; UDP is connectionless and doesn't guarantee delivery.",
+    "metadata": {
+      "topic": "networking"
+    }
+  },
+  {
+    "question": "What is a hash map's average time complexity for lookups?",
+    "contexts": [
+      "A hash map offers average-case O(1) time complexity for lookups, insertions, and deletions.",
+      "A balanced binary search tree offers O(log n) lookups.",
+      "A linked list has O(n) lookup time in the worst case."
+    ],
+    "relevant_contexts": [
+      "A hash map offers average-case O(1) time complexity for lookups, insertions, and deletions."
+    ],
+    "answer": "O(1) average case.",
+    "ground_truth": "O(1) average case.",
+    "metadata": {
+      "topic": "datastructures"
+    }
+  },
+  {
+    "question": "What is the difference between a stack and a queue?",
+    "contexts": [
+      "A stack is Last-In-First-Out (LIFO), while a queue is First-In-First-Out (FIFO).",
+      "A heap is a tree-based structure that satisfies the heap property.",
+      "A graph consists of nodes connected by edges, which may be directed or weighted."
+    ],
+    "relevant_contexts": [
+      "A stack is Last-In-First-Out (LIFO), while a queue is First-In-First-Out (FIFO)."
+    ],
+    "answer": "A stack is LIFO; a queue is FIFO.",
+    "ground_truth": "A stack is LIFO; a queue is FIFO.",
+    "metadata": {
+      "topic": "datastructures"
+    }
+  },
+  {
+    "question": "What is a binary search tree?",
+    "contexts": [
+      "A binary search tree is a tree where each node's left subtree contains smaller values and its right subtree contains larger values.",
+      "A trie is a tree used for efficient prefix-based string lookups.",
+      "A red-black tree is a self-balancing binary search tree."
+    ],
+    "relevant_contexts": [
+      "A binary search tree is a tree where each node's left subtree contains smaller values and its right subtree contains larger values."
+    ],
+    "answer": "A binary search tree stores every value twice, once sorted and once unsorted, for faster lookups.",
+    "ground_truth": "A tree where each node's left subtree has smaller values and right subtree has larger values.",
+    "metadata": {
+      "topic": "datastructures"
+    }
+  }
+]

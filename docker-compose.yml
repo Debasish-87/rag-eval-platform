@@ -1,0 +1,68 @@
+services:
+
+  db:
+    image: postgres:16
+    container_name: rag-eval-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: raguser
+      POSTGRES_PASSWORD: ragpassword
+      POSTGRES_DB: rag_eval
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U raguser -d rag_eval"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    container_name: rag-eval-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_NAME: RAG Evaluation Platform
+      APP_VERSION: "1.0.0"
+      DATABASE_URL: postgresql://raguser:ragpassword@db:5432/rag_eval
+      # "mock" needs no API key and works out of the box. Set
+      # LLM_PROVIDER=gemini and GEMINI_API_KEY (e.g. via a .env file
+      # next to this compose file, or `export GEMINI_API_KEY=...`
+      # before `docker compose up`) to use a real LLM judge instead.
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-flash-latest}
+      CORS_ORIGINS: "*"
+      REPORTS_DIR: reports
+      # Runs the full evaluation pipeline once on first boot so the
+      # dashboard has data immediately. Set to "false" to skip.
+      SEED_ON_START: ${SEED_ON_START:-true}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/reports:/app/reports
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: rag-eval-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "5500:80"
+
+volumes:
+  postgres_data:

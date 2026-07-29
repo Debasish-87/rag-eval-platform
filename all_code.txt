@@ -1,0 +1,6851 @@
+==================================================
+FILE: ./docker-compose.yml
+==================================================
+services:
+
+  db:
+    image: postgres:16
+    container_name: rag-eval-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: raguser
+      POSTGRES_PASSWORD: ragpassword
+      POSTGRES_DB: rag_eval
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U raguser -d rag_eval"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    container_name: rag-eval-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      APP_NAME: RAG Evaluation Platform
+      APP_VERSION: "1.0.0"
+      DATABASE_URL: postgresql://raguser:ragpassword@db:5432/rag_eval
+      # "mock" needs no API key and works out of the box. Set
+      # LLM_PROVIDER=gemini and GEMINI_API_KEY (e.g. via a .env file
+      # next to this compose file, or `export GEMINI_API_KEY=...`
+      # before `docker compose up`) to use a real LLM judge instead.
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-flash-latest}
+      CORS_ORIGINS: "*"
+      REPORTS_DIR: reports
+      # Runs the full evaluation pipeline once on first boot so the
+      # dashboard has data immediately. Set to "false" to skip.
+      SEED_ON_START: ${SEED_ON_START:-true}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/reports:/app/reports
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: rag-eval-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "5500:80"
+
+volumes:
+  postgres_data:
+
+==================================================
+FILE: ./README.md
+==================================================
+# RAG Evaluation Platform
+
+A self-hosted platform for benchmarking Retrieval-Augmented Generation
+(RAG) systems: retrieval quality (Precision@K, Recall@K, MRR, MAP,
+NDCG, HitRate), generation quality (Faithfulness, Correctness,
+Semantic Similarity), and an LLM-as-judge layer (faithfulness,
+answer relevance, hallucination) — with a FastAPI backend, a
+persisted leaderboard, JSON/CSV/Markdown reports, and a live
+dashboard.
+
+## Quickstart (single command, zero config)
+
+```bash
+cd backend
+pip install -r requirements.txt
+python scripts/run_evaluation.py
+```
+
+That's it. This will:
+
+1. Load the bundled benchmark dataset (`app/datasets/sample_dataset.json`)
+2. Run every registered evaluator (retrieval, generation, LLM judge)
+3. Persist `Evaluation` + `Metric` rows and mark the benchmark `completed`
+4. Refresh the leaderboard (computed live from the DB — no extra step)
+5. Generate `reports/report.{json,csv,md}` (and per-benchmark copies)
+6. Print a summary to the terminal
+
+By default it uses a local SQLite database (`backend/rag_eval.db`)
+and a deterministic, **offline** mock LLM judge — no API key, no
+Docker, no external services required to see the whole pipeline run.
+
+To point it at a real Gemini judge and real embeddings instead, see
+[Switching to real LLM/embeddings](#switching-to-real-llmembeddings-optional).
+
+## Run it again, compare runs
+
+```bash
+python scripts/run_evaluation.py --experiment "gpt-4o-mini"
+python scripts/run_evaluation.py --experiment "gemini-2.5-flash"
+```
+
+Every run creates a new `Benchmark` row, so the leaderboard and the
+dashboard's "Run Comparison" chart accumulate history across runs —
+useful for comparing RAG configurations, prompts, or models. See
+`python scripts/run_evaluation.py --help` for all options
+(`--dataset`, `--project`, `--experiment`, `--benchmark`,
+`--reports-dir`).
+
+## See it in the browser
+
+```bash
+# Terminal 1 — API
+cd backend
+uvicorn app.main:app --reload --port 8000
+# -> http://localhost:8000/docs
+
+# Terminal 2 — Dashboard (static files, no build step)
+cd frontend
+python3 -m http.server 5500
+# -> http://localhost:5500
+```
+
+The dashboard's API base URL is editable in its top bar (defaults to
+`http://127.0.0.1:8000`) and auto-refreshes every 8 seconds. It shows:
+
+- Overview stats (projects, datasets, experiments, benchmarks, evaluations, average score)
+- A ranked leaderboard across every benchmark run
+- A run-comparison bar chart and a retrieval / generation / LLM-judge metric breakdown
+- A benchmark drill-down: per-metric radar chart, per-sample table, and JSON/CSV/Markdown report downloads
+- A "Pipeline Run" panel that mirrors the latest `run_evaluation.py` output
+
+## Project layout
+
+```
+backend/
+  app/
+    api/routes/         FastAPI routers (projects, datasets, experiments,
+                         benchmarks, reports, leaderboard, summary)
+    datasets/            Dataset model, loader, validator, sample dataset
+    evaluation/          Evaluation engine + evaluator registry
+    evaluation/evaluators/  RetrievalEvaluator, GenerationEvaluator, LLMJudgeEvaluator
+    metrics/             One class per metric (precision, recall, mrr, map,
+                         ndcg, hit_rate, faithfulness, correctness, semantic_similarity)
+    experiments/          BenchmarkRunner (orchestrates dataset -> engine -> results)
+    llm/                  Pluggable LLM client (mock | gemini)
+    reports/              JSON / CSV / Markdown report generators
+    models/               SQLAlchemy ORM models
+  scripts/run_evaluation.py   The end-to-end pipeline (see above)
+  tests/                 pytest suite (unit + API + integration)
+frontend/
+  index.html / style.css / app.js   The dashboard (no build step)
+```
+
+## Running the tests
+
+```bash
+cd backend
+pip install -r requirements.txt
+pytest
+```
+
+The suite (53 tests) covers:
+
+- **Metrics** (`tests/test_metrics.py`) — each retrieval/generation metric in isolation
+- **Dataset loading & validation** (`tests/test_dataset_loader.py`)
+- **Evaluation engine** (`tests/test_engine.py`) — every evaluator runs and returns typed scores
+- **Benchmark runner** (`tests/test_benchmark.py`) — full dataset run, aggregate scores
+- **Report generators** (`tests/test_reports.py`) — JSON/CSV/Markdown content assertions
+- **API** (`tests/test_api.py`) — FastAPI endpoints via `TestClient`, against an isolated SQLite DB
+- **Pipeline integration** (`tests/test_run_evaluation.py`) — invokes `run_evaluation.py`'s
+  `main()` directly and asserts on the DB rows and report files it produces
+
+Tests run entirely offline against a temporary SQLite database
+(`LLM_PROVIDER=mock` by default in `tests/conftest.py`), so no API
+key or network access is required in CI.
+
+## Switching to real LLM/embeddings (optional)
+
+By default the platform runs fully offline:
+
+- `LLM_PROVIDER=mock` — a deterministic, lexical-overlap heuristic stands
+  in for the LLM judge (`app/llm/mock.py`)
+- `SemanticSimilarity` falls back to token-overlap similarity if
+  `sentence-transformers` / an embeddings model isn't available
+
+For production-quality scoring:
+
+```bash
+cp backend/.env.example backend/.env
+# edit backend/.env:
+#   LLM_PROVIDER=gemini
+#   GEMINI_API_KEY=your-key-here
+pip install google-genai sentence-transformers torch
+python scripts/run_evaluation.py
+```
+
+## Run everything with Docker (one command)
+
+```bash
+docker compose up --build
+```
+
+This starts three containers and wires them together automatically:
+
+| Service    | What it does                                                              | URL                            |
+|------------|----------------------------------------------------------------------------|---------------------------------|
+| `db`       | Postgres 16                                                                | `localhost:5432`               |
+| `backend`  | Runs Alembic migrations, seeds a demo benchmark, then starts the API       | `http://localhost:8000/docs`   |
+| `frontend` | Nginx serving the static dashboard                                        | `http://localhost:5500`        |
+
+On first boot the backend container automatically runs
+`scripts/run_evaluation.py` once (`SEED_ON_START=true` by default) so
+the dashboard has data as soon as everything is up — open
+`http://localhost:5500` after a few seconds. Reports are written to
+`./backend/reports` on the host (mounted as a volume) so they persist
+across restarts and are easy to inspect.
+
+By default the seeded run uses the offline mock LLM judge (no API key
+needed). To seed with a real Gemini judge instead:
+
+```bash
+export LLM_PROVIDER=gemini
+export GEMINI_API_KEY=your-key-here
+docker compose up --build
+```
+
+Other useful commands:
+
+```bash
+# Run the pipeline again inside the running backend container
+docker compose exec backend python scripts/run_evaluation.py --experiment "gpt-4o-mini"
+
+# Tear everything down (add -v to also wipe the Postgres volume)
+docker compose down
+```
+
+If your Docker install uses the older standalone `docker-compose`
+binary, substitute `docker-compose` for `docker compose` above.
+
+## Running Postgres only, backend/frontend locally
+
+```bash
+docker compose up -d db
+# in backend/.env: DATABASE_URL=postgresql://raguser:ragpassword@localhost:5432/rag_eval
+cd backend
+alembic upgrade head
+python scripts/run_evaluation.py
+```
+
+==================================================
+FILE: ./backend/migrations/env.py
+==================================================
+from logging.config import fileConfig
+
+from sqlalchemy import engine_from_config
+from sqlalchemy import pool
+
+from alembic import context
+
+from app.core.config import settings
+from app.db.base import Base
+
+# this is the Alembic Config object, which provides
+# access to the values within the .ini file in use.
+config = context.config
+
+config.set_main_option(
+    "sqlalchemy.url",
+    settings.DATABASE_URL,
+)
+# Interpret the config file for Python logging.
+# This line sets up loggers basically.
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# add your model's MetaData object here
+# for 'autogenerate' support
+# from myapp import mymodel
+# target_metadata = mymodel.Base.metadata
+target_metadata = Base.metadata
+
+# other values from the config, defined by the needs of env.py,
+# can be acquired:
+# my_important_option = config.get_main_option("my_important_option")
+# ... etc.
+
+
+def run_migrations_offline() -> None:
+    """Run migrations in 'offline' mode.
+
+    This configures the context with just a URL
+    and not an Engine, though an Engine is acceptable
+    here as well.  By skipping the Engine creation
+    we don't even need a DBAPI to be available.
+
+    Calls to context.execute() here emit the given string to the
+    script output.
+
+    """
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    """Run migrations in 'online' mode.
+
+    In this scenario we need to create an Engine
+    and associate a connection with the context.
+
+    """
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+
+    with connectable.connect() as connection:
+        context.configure(connection=connection, target_metadata=target_metadata)
+
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+
+==================================================
+FILE: ./backend/migrations/versions/00220a9a77ce_create_projects_table.py
+==================================================
+"""create projects table
+
+Revision ID: 00220a9a77ce
+Revises: 
+Create Date: 2026-07-28 10:05:19.219194
+
+"""
+
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = "00220a9a77ce"
+down_revision: Union[str, Sequence[str], None] = None
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    """Upgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.create_table(
+        "projects",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("name", sa.String(length=255), nullable=False),
+        sa.Column("description", sa.String(), nullable=True),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(op.f("ix_projects_id"), "projects", ["id"], unique=False)
+    # ### end Alembic commands ###
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.drop_index(op.f("ix_projects_id"), table_name="projects")
+    op.drop_table("projects")
+    # ### end Alembic commands ###
+
+==================================================
+FILE: ./backend/migrations/versions/32f7f8027e77_create_datasets_and_experiments.py
+==================================================
+"""create datasets and experiments
+
+Revision ID: 32f7f8027e77
+Revises: 00220a9a77ce
+Create Date: 2026-07-28 16:26:27.468517
+
+"""
+
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = "32f7f8027e77"
+down_revision: Union[str, Sequence[str], None] = "00220a9a77ce"
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    """Upgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.create_table(
+        "datasets",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("project_id", sa.Integer(), nullable=False),
+        sa.Column("name", sa.String(length=255), nullable=False),
+        sa.Column("version", sa.String(length=50), nullable=False),
+        sa.Column("file_path", sa.String(length=500), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.ForeignKeyConstraint(
+            ["project_id"],
+            ["projects.id"],
+        ),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(op.f("ix_datasets_id"), "datasets", ["id"], unique=False)
+    op.create_table(
+        "experiments",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("project_id", sa.Integer(), nullable=False),
+        sa.Column("name", sa.String(length=255), nullable=False),
+        sa.Column("description", sa.String(), nullable=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.ForeignKeyConstraint(
+            ["project_id"],
+            ["projects.id"],
+        ),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(op.f("ix_experiments_id"), "experiments", ["id"], unique=False)
+    op.add_column(
+        "projects",
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+    )
+    op.add_column(
+        "projects",
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+    )
+    # ### end Alembic commands ###
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.drop_column("projects", "updated_at")
+    op.drop_column("projects", "created_at")
+    op.drop_index(op.f("ix_experiments_id"), table_name="experiments")
+    op.drop_table("experiments")
+    op.drop_index(op.f("ix_datasets_id"), table_name="datasets")
+    op.drop_table("datasets")
+    # ### end Alembic commands ###
+
+==================================================
+FILE: ./backend/migrations/versions/b42c766c0c21_create_benchmark_evaluation_and_metric_.py
+==================================================
+"""create benchmark evaluation and metric tables
+
+Revision ID: b42c766c0c21
+Revises: 32f7f8027e77
+Create Date: 2026-07-28 16:28:16.255080
+
+"""
+
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = "b42c766c0c21"
+down_revision: Union[str, Sequence[str], None] = "32f7f8027e77"
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    """Upgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.create_table(
+        "benchmarks",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("experiment_id", sa.Integer(), nullable=False),
+        sa.Column("name", sa.String(length=255), nullable=False),
+        sa.Column("status", sa.String(length=20), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.ForeignKeyConstraint(
+            ["experiment_id"],
+            ["experiments.id"],
+        ),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(op.f("ix_benchmarks_id"), "benchmarks", ["id"], unique=False)
+    op.create_table(
+        "evaluations",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("benchmark_id", sa.Integer(), nullable=False),
+        sa.Column("query", sa.Text(), nullable=False),
+        sa.Column("answer", sa.Text(), nullable=False),
+        sa.Column("ground_truth", sa.Text(), nullable=True),
+        sa.ForeignKeyConstraint(
+            ["benchmark_id"],
+            ["benchmarks.id"],
+        ),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(op.f("ix_evaluations_id"), "evaluations", ["id"], unique=False)
+    op.create_table(
+        "metrics",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("evaluation_id", sa.Integer(), nullable=False),
+        sa.Column("name", sa.String(length=100), nullable=False),
+        sa.Column("score", sa.Float(), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["evaluation_id"],
+            ["evaluations.id"],
+        ),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(op.f("ix_metrics_id"), "metrics", ["id"], unique=False)
+    # ### end Alembic commands ###
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    # ### commands auto generated by Alembic - please adjust! ###
+    op.drop_index(op.f("ix_metrics_id"), table_name="metrics")
+    op.drop_table("metrics")
+    op.drop_index(op.f("ix_evaluations_id"), table_name="evaluations")
+    op.drop_table("evaluations")
+    op.drop_index(op.f("ix_benchmarks_id"), table_name="benchmarks")
+    op.drop_table("benchmarks")
+    # ### end Alembic commands ###
+
+==================================================
+FILE: ./backend/Dockerfile
+==================================================
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# System deps needed to build psycopg2 / other C extensions.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libpq-dev curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN chmod +x docker-entrypoint.sh
+
+EXPOSE 8000
+
+ENTRYPOINT ["./docker-entrypoint.sh"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+==================================================
+FILE: ./backend/alembic.ini
+==================================================
+# A generic, single database configuration.
+
+[alembic]
+# path to migration scripts.
+# this is typically a path given in POSIX (e.g. forward slashes)
+# format, relative to the token %(here)s which refers to the location of this
+# ini file
+script_location = %(here)s/migrations
+
+# template used to generate migration file names; The default value is %%(rev)s_%%(slug)s
+# Uncomment the line below if you want the files to be prepended with date and time
+# see https://alembic.sqlalchemy.org/en/latest/tutorial.html#editing-the-ini-file
+# for all available tokens
+# file_template = %%(year)d_%%(month).2d_%%(day).2d_%%(hour).2d%%(minute).2d-%%(rev)s_%%(slug)s
+# Or organize into date-based subdirectories (requires recursive_version_locations = true)
+# file_template = %%(year)d/%%(month).2d/%%(day).2d_%%(hour).2d%%(minute).2d_%%(second).2d_%%(rev)s_%%(slug)s
+
+# sys.path path, will be prepended to sys.path if present.
+# defaults to the current working directory.  for multiple paths, the path separator
+# is defined by "path_separator" below.
+prepend_sys_path = .
+
+
+# timezone to use when rendering the date within the migration file
+# as well as the filename.
+# If specified, requires the tzdata library which can be installed by adding
+# `alembic[tz]` to the pip requirements.
+# string value is passed to ZoneInfo()
+# leave blank for localtime
+# timezone =
+
+# max length of characters to apply to the "slug" field
+# truncate_slug_length = 40
+
+# set to 'true' to run the environment during
+# the 'revision' command, regardless of autogenerate
+# revision_environment = false
+
+# set to 'true' to allow .pyc and .pyo files without
+# a source .py file to be detected as revisions in the
+# versions/ directory
+# sourceless = false
+
+# version location specification; This defaults
+# to <script_location>/versions.  When using multiple version
+# directories, initial revisions must be specified with --version-path.
+# The path separator used here should be the separator specified by "path_separator"
+# below.
+# version_locations = %(here)s/bar:%(here)s/bat:%(here)s/alembic/versions
+
+# path_separator; This indicates what character is used to split lists of file
+# paths, including version_locations and prepend_sys_path within configparser
+# files such as alembic.ini.
+# The default rendered in new alembic.ini files is "os", which uses os.pathsep
+# to provide os-dependent path splitting.
+#
+# Note that in order to support legacy alembic.ini files, this default does NOT
+# take place if path_separator is not present in alembic.ini.  If this
+# option is omitted entirely, fallback logic is as follows:
+#
+# 1. Parsing of the version_locations option falls back to using the legacy
+#    "version_path_separator" key, which if absent then falls back to the legacy
+#    behavior of splitting on spaces and/or commas.
+# 2. Parsing of the prepend_sys_path option falls back to the legacy
+#    behavior of splitting on spaces, commas, or colons.
+#
+# Valid values for path_separator are:
+#
+# path_separator = :
+# path_separator = ;
+# path_separator = space
+# path_separator = newline
+#
+# Use os.pathsep. Default configuration used for new projects.
+path_separator = os
+
+# set to 'true' to search source files recursively
+# in each "version_locations" directory
+# new in Alembic version 1.10
+# recursive_version_locations = false
+
+# the output encoding used when revision files
+# are written from script.py.mako
+# output_encoding = utf-8
+
+# database URL.  This is consumed by the user-maintained env.py script only.
+# other means of configuring database URLs may be customized within the env.py
+# file.
+sqlalchemy.url = driver://user:pass@localhost/dbname
+
+
+[post_write_hooks]
+# post_write_hooks defines scripts or Python functions that are run
+# on newly generated revision scripts.  See the documentation for further
+# detail and examples
+
+# format using "black" - use the console_scripts runner, against the "black" entrypoint
+# hooks = black
+# black.type = console_scripts
+# black.entrypoint = black
+# black.options = -l 79 REVISION_SCRIPT_FILENAME
+
+# lint with attempts to fix using "ruff" - use the module runner, against the "ruff" module
+# hooks = ruff
+# ruff.type = module
+# ruff.module = ruff
+# ruff.options = check --fix REVISION_SCRIPT_FILENAME
+
+# Alternatively, use the exec runner to execute a binary found on your PATH
+# hooks = ruff
+# ruff.type = exec
+# ruff.executable = ruff
+# ruff.options = check --fix REVISION_SCRIPT_FILENAME
+
+# Logging configuration.  This is also consumed by the user-maintained
+# env.py script only.
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARNING
+handlers = console
+qualname =
+
+[logger_sqlalchemy]
+level = WARNING
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+datefmt = %H:%M:%S
+
+==================================================
+FILE: ./backend/app/experiments/registry.py
+==================================================
+from app.experiments.experiment import (
+    ExperimentManager,
+)
+
+
+class ExperimentRegistry:
+    """
+    In-memory registry for active experiments.
+    """
+
+    _experiments: dict[
+        str,
+        ExperimentManager,
+    ] = {}
+
+    @classmethod
+    def register(
+        cls,
+        manager: ExperimentManager,
+    ) -> None:
+        """
+        Register an experiment manager.
+        """
+
+        cls._experiments[manager.experiment.experiment_id] = manager
+
+    @classmethod
+    def get(
+        cls,
+        experiment_id: str,
+    ) -> ExperimentManager | None:
+        """
+        Retrieve an experiment by its ID.
+        """
+
+        return cls._experiments.get(experiment_id)
+
+    @classmethod
+    def list(
+        cls,
+    ) -> list[ExperimentManager]:
+        """
+        Return all registered experiments.
+        """
+
+        return list(cls._experiments.values())
+
+    @classmethod
+    def unregister(
+        cls,
+        experiment_id: str,
+    ) -> None:
+        """
+        Remove an experiment from the registry.
+        """
+
+        cls._experiments.pop(
+            experiment_id,
+            None,
+        )
+
+    @classmethod
+    def clear(cls) -> None:
+        """
+        Remove all registered experiments.
+        """
+
+        cls._experiments.clear()
+
+==================================================
+FILE: ./backend/app/experiments/models.py
+==================================================
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+from uuid import uuid4
+
+from app.evaluation.models import EvaluationSummary
+
+
+@dataclass(slots=True)
+class Experiment:
+    """
+    Lightweight, in-memory record of an experiment (a named,
+    ongoing series of benchmark runs against one RAG system).
+    """
+
+    name: str
+    description: str = ""
+
+    experiment_id: str = field(default_factory=lambda: str(uuid4()))
+
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+    # Benchmark IDs produced by this experiment.
+    benchmarks: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class BenchmarkError:
+    """
+    Represents a failed benchmark sample.
+    """
+
+    sample: int
+    question: str
+    error: str
+
+
+@dataclass(slots=True)
+class BenchmarkResult:
+    """
+    Represents the outcome of a benchmark execution.
+    """
+
+    # Unique benchmark identifier
+    benchmark_id: str = field(default_factory=lambda: str(uuid4()))
+
+    # Dataset information
+    dataset_name: str = ""
+    dataset_version: str = "1.0"
+
+    # Execution statistics
+    total_samples: int = 0
+    successful_samples: int = 0
+    failed_samples: int = 0
+
+    # Timing
+    started_at: datetime = field(default_factory=datetime.utcnow)
+    completed_at: datetime | None = None
+    duration_ms: float = 0.0
+
+    # Aggregated metrics
+    average_scores: dict[str, float] = field(default_factory=dict)
+
+    # Per-sample evaluation results
+    results: list[EvaluationSummary] = field(default_factory=list)
+
+    # Failed evaluations
+    errors: list[BenchmarkError] = field(default_factory=list)
+
+    # Runtime information
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def success_rate(self) -> float:
+        """
+        Percentage of successfully evaluated samples.
+        """
+
+        if self.total_samples == 0:
+            return 0.0
+
+        return round(
+            self.successful_samples / self.total_samples,
+            4,
+        )
+
+    @property
+    def failure_rate(self) -> float:
+        """
+        Percentage of failed samples.
+        """
+
+        if self.total_samples == 0:
+            return 0.0
+
+        return round(
+            self.failed_samples / self.total_samples,
+            4,
+        )
+
+    @property
+    def is_successful(self) -> bool:
+        """
+        True if all samples were evaluated successfully.
+        """
+
+        return self.failed_samples == 0
+
+    def add_result(
+        self,
+        result: EvaluationSummary,
+    ) -> None:
+        """
+        Add a single sample evaluation.
+        """
+
+        self.results.append(result)
+
+    def add_error(
+        self,
+        *,
+        sample: int,
+        question: str,
+        error: str,
+    ) -> None:
+        """
+        Add a failed sample.
+        """
+
+        self.errors.append(
+            BenchmarkError(
+                sample=sample,
+                question=question,
+                error=error,
+            )
+        )
+
+==================================================
+FILE: ./backend/app/experiments/benchmark.py
+==================================================
+from collections import defaultdict
+from datetime import datetime
+import time
+
+from app.core.config import settings
+from app.datasets.models import Dataset
+from app.datasets.validator import DatasetValidator
+from app.evaluation.engine import EvaluationEngine
+from app.evaluation.models import EvaluationRequest
+from app.experiments.models import BenchmarkResult
+
+
+class BenchmarkRunner:
+    """
+    Executes an entire benchmark dataset using the EvaluationEngine.
+    """
+
+    def __init__(self) -> None:
+        self.engine = EvaluationEngine()
+
+    def run(
+        self,
+        dataset: Dataset,
+    ) -> BenchmarkResult:
+
+        DatasetValidator.validate(dataset)
+
+        started_at = datetime.utcnow()
+        start_timer = time.perf_counter()
+
+        metric_totals: dict[str, float] = defaultdict(float)
+        metric_counts: dict[str, int] = defaultdict(int)
+
+        successful = 0
+        failed = 0
+
+        benchmark = BenchmarkResult(
+            dataset_name=dataset.name,
+            total_samples=len(dataset),
+            started_at=started_at,
+            metadata={
+                "provider": settings.LLM_PROVIDER,
+                "model": settings.GEMINI_MODEL,
+                "engine": "EvaluationEngine",
+            },
+        )
+
+        batch_size = settings.LLM_BATCH_SIZE
+
+        for batch_start in range(
+            0,
+            len(dataset.samples),
+            batch_size,
+        ):
+
+            batch_samples = dataset.samples[batch_start : batch_start + batch_size]
+
+            # print(
+            #     f"Processing batch {batch_start // batch_size + 1} "
+            #     f"({len(batch_samples)} samples)"
+            # )
+
+            batch_requests = []
+
+            for sample in batch_samples:
+
+                batch_requests.append(
+                    EvaluationRequest(
+                        query=sample.question,
+                        contexts=sample.contexts,
+                        answer=sample.answer,
+                        ground_truth=sample.ground_truth,
+                        relevant_contexts=sample.relevant_contexts,
+                    )
+                )
+
+            try:
+
+                summaries = self.engine.evaluate_batch(batch_requests)
+
+                for sample, summary in zip(
+                    batch_samples,
+                    summaries,
+                ):
+
+                    benchmark.add_result(summary)
+
+                    successful += 1
+
+                    for evaluator in summary.evaluators:
+
+                        for metric in evaluator.metrics:
+
+                            metric_totals[metric.name] += metric.score
+                            metric_counts[metric.name] += 1
+
+            except Exception as exc:
+
+                failed += len(batch_samples)
+
+                for offset, sample in enumerate(batch_samples):
+
+                    benchmark.add_error(
+                        sample=batch_start + offset + 1,
+                        question=sample.question,
+                        error=str(exc),
+                    )
+
+        average_scores = {
+            metric_name: round(
+                metric_totals[metric_name] / metric_counts[metric_name],
+                4,
+            )
+            for metric_name in metric_totals
+        }
+
+        benchmark.successful_samples = successful
+        benchmark.failed_samples = failed
+        benchmark.completed_at = datetime.utcnow()
+
+        benchmark.duration_ms = round(
+            (time.perf_counter() - start_timer) * 1000,
+            2,
+        )
+
+        benchmark.average_scores = average_scores
+
+        return benchmark
+
+==================================================
+FILE: ./backend/app/experiments/experiment.py
+==================================================
+from app.experiments.models import (
+    BenchmarkResult,
+    Experiment,
+)
+
+
+class ExperimentManager:
+    """
+    Manages benchmark executions for a single experiment.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        description: str = "",
+    ) -> None:
+
+        self.experiment = Experiment(
+            name=name,
+            description=description,
+        )
+
+        self.results: list[BenchmarkResult] = []
+
+    def add_result(
+        self,
+        result: BenchmarkResult,
+    ) -> None:
+        """
+        Add a benchmark result to the experiment.
+        """
+
+        self.results.append(result)
+
+        self.experiment.benchmarks.append(result.benchmark_id)
+
+    def get_results(
+        self,
+    ) -> list[BenchmarkResult]:
+        """
+        Return all benchmark results.
+        """
+
+        return self.results
+
+    def latest_result(
+        self,
+    ) -> BenchmarkResult | None:
+        """
+        Return the most recent benchmark result.
+        """
+
+        if not self.results:
+            return None
+
+        return self.results[-1]
+
+    @property
+    def benchmark_count(self) -> int:
+        """
+        Number of benchmark runs.
+        """
+
+        return len(self.results)
+
+==================================================
+FILE: ./backend/app/db/session.py
+==================================================
+from app.db.database import SessionLocal
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+==================================================
+FILE: ./backend/app/db/database.py
+==================================================
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from app.core.config import settings
+
+_connect_args = (
+    {"check_same_thread": False} if settings.DATABASE_URL.startswith("sqlite") else {}
+)
+
+engine = create_engine(
+    settings.DATABASE_URL,
+    echo=settings.DEBUG,
+    connect_args=_connect_args,
+)
+
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine,
+)
+
+==================================================
+FILE: ./backend/app/db/base.py
+==================================================
+from sqlalchemy.orm import DeclarativeBase
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+# Import all models here
+from app.models import *  # noqa
+
+==================================================
+FILE: ./backend/app/evaluation/evaluators/generation.py
+==================================================
+from app.evaluation.evaluator import BaseEvaluator
+from app.evaluation.metric_runner import MetricRunner
+from app.evaluation.models import (
+    EvaluationRequest,
+    EvaluatorResult,
+)
+
+from app.metrics.correctness import Correctness
+from app.metrics.faithfulness import Faithfulness
+from app.metrics.semantic_similarity import SemanticSimilarity
+
+
+class GenerationEvaluator(BaseEvaluator):
+    """
+    Evaluates the quality of a generated answer using
+    generation-based metrics.
+    """
+
+    def __init__(self) -> None:
+        self.metric_runner = MetricRunner(
+            metrics={
+                "faithfulness": Faithfulness(),
+                "correctness": Correctness(),
+                "semantic_similarity": SemanticSimilarity(),
+            }
+        )
+
+    def evaluate(
+        self,
+        request: EvaluationRequest,
+    ) -> EvaluatorResult:
+        """
+        Evaluate the generated answer and return
+        typed evaluation results.
+        """
+
+        metrics = self.metric_runner.run(request)
+
+        return EvaluatorResult(
+            evaluator="GenerationEvaluator",
+            metrics=metrics,
+            metadata={
+                "answer_length": len(request.answer),
+                "contexts_used": len(request.contexts),
+            },
+        )
+
+==================================================
+FILE: ./backend/app/evaluation/evaluators/retrieval.py
+==================================================
+from app.evaluation.evaluator import BaseEvaluator
+from app.evaluation.metric_runner import MetricRunner
+from app.evaluation.models import (
+    EvaluationRequest,
+    EvaluatorResult,
+)
+
+from app.metrics.hit_rate import HitRate
+from app.metrics.map import MAP
+from app.metrics.mrr import MRR
+from app.metrics.ndcg import NDCG
+from app.metrics.precision import PrecisionAtK
+from app.metrics.recall import RecallAtK
+
+
+class RetrievalEvaluator(BaseEvaluator):
+    """
+    Evaluates retrieval quality using retrieval metrics.
+    """
+
+    def __init__(self) -> None:
+
+        k = 2
+
+        self.metric_runner = MetricRunner(
+            metrics={
+                f"precision@{k}": PrecisionAtK(k=k),
+                f"recall@{k}": RecallAtK(k=k),
+                "mrr": MRR(),
+                "hit_rate": HitRate(),
+                f"ndcg@{k}": NDCG(k=k),
+                f"map@{k}": MAP(k=k),
+            }
+        )
+
+    def evaluate(
+        self,
+        request: EvaluationRequest,
+    ) -> EvaluatorResult:
+        """
+        Evaluate retrieval performance and return
+        typed evaluation results.
+        """
+
+        metrics = self.metric_runner.run(request)
+
+        return EvaluatorResult(
+            evaluator="RetrievalEvaluator",
+            metrics=metrics,
+            metadata={
+                "query": request.query,
+                "retrieved_documents": len(request.contexts),
+                "relevant_documents": len(request.relevant_contexts),
+            },
+        )
+
+==================================================
+FILE: ./backend/app/evaluation/evaluators/llm_judge.py
+==================================================
+from app.core.config import settings
+from app.evaluation.evaluator import BaseEvaluator
+from app.evaluation.models import (
+    EvaluationRequest,
+    EvaluatorResult,
+    MetricResult,
+)
+from app.llm.client import LLMClient
+from app.llm.parser import LLMResponseParser
+
+
+class LLMJudgeEvaluator(BaseEvaluator):
+    """
+    Evaluates RAG responses using an LLM as a judge.
+    """
+
+    def __init__(self) -> None:
+        self.client = LLMClient()
+
+    def evaluate(
+        self,
+        request: EvaluationRequest,
+    ) -> EvaluatorResult:
+        """
+        Evaluate a generated answer using an LLM.
+        """
+
+        prompt = f"""
+You are an expert RAG evaluation assistant.
+
+Evaluate the generated answer using ONLY the retrieved context.
+
+Instructions:
+
+- Score each metric between 0.0 and 1.0.
+- Do NOT use outside knowledge.
+- If the answer contains unsupported facts, increase hallucination.
+- Return ONLY valid JSON.
+- Do NOT wrap the JSON in markdown.
+- Do NOT include explanations outside the JSON.
+
+Question:
+{request.query}
+
+Retrieved Context:
+{chr(10).join(request.contexts)}
+
+Generated Answer:
+{request.answer}
+
+Return exactly this JSON schema:
+
+{{
+    "faithfulness": 0.0,
+    "answer_relevance": 0.0,
+    "hallucination": 0.0,
+    "reason": ""
+}}
+"""
+        
+        try:
+            response = self.client.evaluate(prompt)
+
+        except Exception as exc:
+            return EvaluatorResult(
+                evaluator="LLMJudgeEvaluator",
+                metrics=[
+                    MetricResult(
+                        name="llm_faithfulness",
+                        score=0.0,
+                    ),
+                    MetricResult(
+                        name="answer_relevance",
+                        score=0.0,
+                    ),
+                    MetricResult(
+                        name="hallucination",
+                        score=1.0,
+                    ),
+                ],
+                metadata={
+                    "provider": settings.LLM_PROVIDER,
+                    "model": settings.GEMINI_MODEL,
+                    "error": str(exc),
+                },
+            )
+
+        try:
+            result = LLMResponseParser.parse(response)
+
+        except ValueError as exc:
+
+            metadata = {
+                "provider": settings.LLM_PROVIDER,
+                "model": settings.GEMINI_MODEL,
+                "error": str(exc),
+            }
+
+            if settings.DEBUG:
+                metadata["prompt"] = prompt
+                metadata["raw_response"] = response
+
+            return EvaluatorResult(
+                evaluator="LLMJudgeEvaluator",
+                metrics=[
+                    MetricResult(
+                        name="llm_faithfulness",
+                        score=0.0,
+                    ),
+                    MetricResult(
+                        name="answer_relevance",
+                        score=0.0,
+                    ),
+                    MetricResult(
+                        name="hallucination",
+                        score=1.0,
+                    ),
+                ],
+                metadata=metadata,
+            )
+
+        metadata = {
+            "reason": result["reason"],
+            "provider": settings.LLM_PROVIDER,
+            "model": settings.GEMINI_MODEL,
+        }
+
+        if settings.DEBUG:
+            metadata["prompt"] = prompt
+            metadata["raw_response"] = response
+
+        return EvaluatorResult(
+            evaluator="LLMJudgeEvaluator",
+            metrics=[
+                MetricResult(
+                    name="llm_faithfulness",
+                    score=float(result["faithfulness"]),
+                ),
+                MetricResult(
+                    name="answer_relevance",
+                    score=float(result["answer_relevance"]),
+                ),
+                MetricResult(
+                    name="hallucination",
+                    score=float(result["hallucination"]),
+                ),
+            ],
+            metadata=metadata,
+        )
+
+    def _build_batch_prompt(
+        self,
+        requests: list[EvaluationRequest],
+    ) -> str:
+
+        items = []
+
+        for index, request in enumerate(requests, start=1):
+            items.append(
+                f"""
+    Item {index}
+
+    Question:
+    {request.query}
+
+    Retrieved Context:
+    {chr(10).join(request.contexts)}
+
+    Generated Answer:
+    {request.answer}
+    """
+            )
+
+        return f"""
+    You are an expert RAG evaluation assistant.
+
+    Evaluate every item independently.
+
+    Rules:
+
+    - Use ONLY the retrieved context.
+    - Score between 0.0 and 1.0.
+    - Return ONLY valid JSON.
+    - Do NOT use markdown.
+    - Return a JSON array.
+
+    Return exactly {len(requests)} JSON objects.
+
+    The first object corresponds to Item 1.
+    The second object corresponds to Item 2.
+    Continue in the same order.
+    Do not omit, reorder, or merge items.
+
+    Example:
+
+    [
+    {{
+        "faithfulness": 0.0,
+        "answer_relevance": 0.0,
+        "hallucination": 0.0,
+        "reason": ""
+    }}
+    ]
+
+    Items:
+
+    {chr(10).join(items)}
+    """
+
+    def evaluate_batch(
+        self,
+        requests: list[EvaluationRequest],
+    ) -> list[EvaluatorResult]:
+        """
+        Evaluate multiple requests in a single LLM call.
+        """
+
+        if not requests:
+            return []
+
+        prompt = self._build_batch_prompt(requests)
+        # print(f"Calling Gemini for batch of {len(requests)} requests")
+
+        try:
+            response = self.client.evaluate(prompt)
+
+        except Exception as exc:
+
+            results = []
+
+            for _ in requests:
+
+                results.append(
+                    EvaluatorResult(
+                        evaluator="LLMJudgeEvaluator",
+                        metrics=[
+                            MetricResult(
+                                name="llm_faithfulness",
+                                score=0.0,
+                            ),
+                            MetricResult(
+                                name="answer_relevance",
+                                score=0.0,
+                            ),
+                            MetricResult(
+                                name="hallucination",
+                                score=1.0,
+                            ),
+                        ],
+                        metadata={
+                            "provider": settings.LLM_PROVIDER,
+                            "model": settings.GEMINI_MODEL,
+                            "error": str(exc),
+                        },
+                    )
+                )
+
+            return results
+
+        try:
+            parsed_results = LLMResponseParser.parse_batch(response)
+
+        except ValueError as exc:
+
+            results = []
+
+            for _ in requests:
+
+                metadata = {
+                    "provider": settings.LLM_PROVIDER,
+                    "model": settings.GEMINI_MODEL,
+                    "error": str(exc),
+                }
+
+                if settings.DEBUG:
+                    metadata["prompt"] = prompt
+                    metadata["raw_response"] = response
+
+                results.append(
+                    EvaluatorResult(
+                        evaluator="LLMJudgeEvaluator",
+                        metrics=[
+                            MetricResult(
+                                name="llm_faithfulness",
+                                score=0.0,
+                            ),
+                            MetricResult(
+                                name="answer_relevance",
+                                score=0.0,
+                            ),
+                            MetricResult(
+                                name="hallucination",
+                                score=1.0,
+                            ),
+                        ],
+                        metadata=metadata,
+                    )
+                )
+
+            return results
+
+        if len(parsed_results) != len(requests):
+
+            results = []
+
+            for _ in requests:
+
+                results.append(
+                    EvaluatorResult(
+                        evaluator="LLMJudgeEvaluator",
+                        metrics=[
+                            MetricResult(
+                                name="llm_faithfulness",
+                                score=0.0,
+                            ),
+                            MetricResult(
+                                name="answer_relevance",
+                                score=0.0,
+                            ),
+                            MetricResult(
+                                name="hallucination",
+                                score=1.0,
+                            ),
+                        ],
+                        metadata={
+                            "provider": settings.LLM_PROVIDER,
+                            "model": settings.GEMINI_MODEL,
+                            "error": (
+                                f"Expected {len(requests)} results, "
+                                f"received {len(parsed_results)}."
+                            ),
+                        },
+                    )
+                )
+
+            return results
+
+        results = []
+
+        for result in parsed_results:
+
+            metadata = {
+                "reason": result["reason"],
+                "provider": settings.LLM_PROVIDER,
+                "model": settings.GEMINI_MODEL,
+            }
+
+            if settings.DEBUG:
+                metadata["prompt"] = prompt
+                metadata["raw_response"] = response
+
+            results.append(
+                EvaluatorResult(
+                    evaluator="LLMJudgeEvaluator",
+                    metrics=[
+                        MetricResult(
+                            name="llm_faithfulness",
+                            score=float(result["faithfulness"]),
+                        ),
+                        MetricResult(
+                            name="answer_relevance",
+                            score=float(result["answer_relevance"]),
+                        ),
+                        MetricResult(
+                            name="hallucination",
+                            score=float(result["hallucination"]),
+                        ),
+                    ],
+                    metadata=metadata,
+                )
+            )
+
+        return results
+
+==================================================
+FILE: ./backend/app/evaluation/evaluators/__init__.py
+==================================================
+
+==================================================
+FILE: ./backend/app/evaluation/registry.py
+==================================================
+from app.evaluation.evaluator import BaseEvaluator
+from app.evaluation.evaluators.generation import (
+    GenerationEvaluator,
+)
+from app.evaluation.evaluators.llm_judge import (
+    LLMJudgeEvaluator,
+)
+from app.evaluation.evaluators.retrieval import (
+    RetrievalEvaluator,
+)
+
+
+class EvaluatorRegistry:
+    """
+    Registry for all available evaluators.
+    """
+
+    _evaluators: list[type[BaseEvaluator]] = [
+        RetrievalEvaluator,
+        GenerationEvaluator,
+        LLMJudgeEvaluator,
+    ]
+
+    @classmethod
+    def get_evaluators(
+        cls,
+    ) -> list[BaseEvaluator]:
+        """
+        Return instances of all registered evaluators.
+        """
+
+        return [evaluator() for evaluator in cls._evaluators]
+
+    @classmethod
+    def register(
+        cls,
+        evaluator: type[BaseEvaluator],
+    ) -> None:
+        """
+        Register a new evaluator.
+        """
+
+        if evaluator not in cls._evaluators:
+            cls._evaluators.append(evaluator)
+
+    @classmethod
+    def unregister(
+        cls,
+        evaluator: type[BaseEvaluator],
+    ) -> None:
+        """
+        Remove an evaluator from the registry.
+        """
+
+        if evaluator in cls._evaluators:
+            cls._evaluators.remove(evaluator)
+
+    @classmethod
+    def clear(cls) -> None:
+        """
+        Remove all registered evaluators.
+        """
+
+        cls._evaluators.clear()
+
+==================================================
+FILE: ./backend/app/evaluation/models.py
+==================================================
+from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass(slots=True)
+class EvaluationRequest:
+    """
+    Input required for evaluating a single RAG response.
+    """
+
+    query: str
+    contexts: list[str]
+    answer: str
+
+    ground_truth: str | None = None
+
+    relevant_contexts: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class MetricResult:
+    """
+    Represents a single metric score.
+    """
+
+    name: str
+    score: float
+
+
+@dataclass(slots=True)
+class EvaluatorResult:
+    """
+    Result produced by one evaluator
+    (Retrieval, Generation, LLM Judge).
+    """
+
+    evaluator: str
+
+    metrics: list[MetricResult] = field(default_factory=list)
+
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def metric_dict(self) -> dict[str, float]:
+        """
+        Convenience helper for reports.
+        """
+
+        return {metric.name: metric.score for metric in self.metrics}
+
+
+@dataclass(slots=True)
+class EvaluationSummary:
+    """
+    Complete evaluation for one sample.
+    """
+
+    evaluators: list[EvaluatorResult] = field(default_factory=list)
+
+    def get(
+        self,
+        evaluator: str,
+    ) -> EvaluatorResult | None:
+
+        for item in self.evaluators:
+            if item.evaluator == evaluator:
+                return item
+
+        return None
+
+==================================================
+FILE: ./backend/app/evaluation/metric_runner.py
+==================================================
+from app.evaluation.models import (
+    EvaluationRequest,
+    MetricResult,
+)
+from app.metrics.base import BaseMetric
+
+
+class MetricRunner:
+    """
+    Executes a collection of metrics for an evaluation request.
+    """
+
+    def __init__(
+        self,
+        metrics: dict[str, BaseMetric],
+    ) -> None:
+        self.metrics = metrics
+
+    def run(
+        self,
+        request: EvaluationRequest,
+    ) -> list[MetricResult]:
+        """
+        Compute all configured metrics and return
+        them as typed MetricResult objects.
+        """
+
+        results: list[MetricResult] = []
+
+        for name, metric in self.metrics.items():
+            results.append(
+                MetricResult(
+                    name=name,
+                    score=metric.compute(request),
+                )
+            )
+
+        return results
+
+==================================================
+FILE: ./backend/app/evaluation/hallucination/claim_extractor.py
+==================================================
+from abc import ABC, abstractmethod
+
+from app.llm.client import LLMClient
+
+
+class BaseClaimExtractor(ABC):
+    """
+    Base interface for claim extraction.
+    """
+
+    @abstractmethod
+    def extract(
+        self,
+        answer: str,
+    ) -> list[str]:
+        """
+        Extract factual claims from an answer.
+        """
+        raise NotImplementedError
+
+
+class LLMClaimExtractor(BaseClaimExtractor):
+    """
+    Uses an LLM to extract factual claims.
+    """
+
+    def __init__(self):
+        self.client = LLMClient()
+
+    def extract(
+        self,
+        answer: str,
+    ) -> list[str]:
+
+        if not answer.strip():
+            return []
+
+        prompt = f"""
+You are an information extraction assistant.
+
+Extract ONLY factual claims from the answer.
+
+Rules:
+
+- One claim per line.
+- Preserve wording.
+- Ignore opinions.
+- Ignore greetings.
+- Ignore explanations.
+- Return plain text only.
+- No numbering.
+- No markdown.
+
+Answer:
+
+{answer}
+"""
+
+        response = self.client.evaluate(prompt)
+
+        claims = [line.strip() for line in response.splitlines() if line.strip()]
+
+        return claims
+
+==================================================
+FILE: ./backend/app/evaluation/hallucination/models.py
+==================================================
+from dataclasses import dataclass, field
+
+
+@dataclass(slots=True)
+class ClaimResult:
+    """
+    Result of verifying a single factual claim.
+    """
+
+    claim: str
+    verdict: str
+    evidence: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class HallucinationResult:
+    """
+    Final hallucination detection output.
+    """
+
+    score: float
+
+    supported_claims: list[ClaimResult] = field(default_factory=list)
+
+    unsupported_claims: list[ClaimResult] = field(default_factory=list)
+
+    contradicted_claims: list[ClaimResult] = field(default_factory=list)
+
+    summary: str = ""
+
+==================================================
+FILE: ./backend/app/evaluation/hallucination/claim_verifier.py
+==================================================
+from abc import ABC, abstractmethod
+
+from app.llm.client import LLMClient
+
+from app.evaluation.hallucination.models import (
+    ClaimResult,
+    HallucinationResult,
+)
+from app.llm.parser import LLMResponseParser
+
+
+class BaseClaimVerifier(ABC):
+
+    @abstractmethod
+    def verify(
+        self,
+        question: str,
+        contexts: list[str],
+        answer: str,
+    ) -> HallucinationResult:
+        raise NotImplementedError
+
+
+class LLMClaimVerifier(BaseClaimVerifier):
+
+    def __init__(self):
+        self.client = LLMClient()
+
+    def verify(
+        self,
+        question: str,
+        contexts: list[str],
+        answer: str,
+    ) -> HallucinationResult:
+
+        context = "\n".join(contexts)
+
+        prompt = f"""
+You are an expert RAG evaluator.
+
+Task:
+
+Analyze the generated answer using ONLY the retrieved context.
+
+Return ONLY valid JSON.
+
+JSON Schema:
+
+{{
+  "score": 0.0,
+  "supported_claims": [
+    {{
+      "claim": "",
+      "evidence": []
+    }}
+  ],
+  "unsupported_claims": [
+    {{
+      "claim": "",
+      "evidence": []
+    }}
+  ],
+  "contradicted_claims": [
+    {{
+      "claim": "",
+      "evidence": []
+    }}
+  ],
+  "summary": ""
+}}
+
+Question:
+{question}
+
+Retrieved Context:
+{context}
+
+Generated Answer:
+{answer}
+"""
+
+        response = self.client.evaluate(prompt)
+
+        result = LLMResponseParser.parse(response)
+
+        supported = [
+            ClaimResult(
+                claim=item["claim"],
+                verdict="supported",
+                evidence=item.get("evidence", []),
+            )
+            for item in result.get("supported_claims", [])
+        ]
+
+        unsupported = [
+            ClaimResult(
+                claim=item["claim"],
+                verdict="unsupported",
+                evidence=item.get("evidence", []),
+            )
+            for item in result.get("unsupported_claims", [])
+        ]
+
+        contradicted = [
+            ClaimResult(
+                claim=item["claim"],
+                verdict="contradicted",
+                evidence=item.get("evidence", []),
+            )
+            for item in result.get("contradicted_claims", [])
+        ]
+
+        return HallucinationResult(
+            score=float(result["score"]),
+            supported_claims=supported,
+            unsupported_claims=unsupported,
+            contradicted_claims=contradicted,
+            summary=result["summary"],
+        )
+
+==================================================
+FILE: ./backend/app/evaluation/evaluator.py
+==================================================
+from abc import ABC, abstractmethod
+
+from app.evaluation.models import (
+    EvaluationRequest,
+    EvaluatorResult,
+)
+
+
+class BaseEvaluator(ABC):
+    """
+    Base interface for all evaluation components.
+    """
+
+    @abstractmethod
+    def evaluate(
+        self,
+        request: EvaluationRequest,
+    ) -> EvaluatorResult:
+        """
+        Evaluate a single request and return the evaluator result.
+        """
+        raise NotImplementedError
+
+    def evaluate_batch(
+        self,
+        requests: list[EvaluationRequest],
+    ) -> list[EvaluatorResult]:
+        """
+        Default batch implementation.
+
+        Evaluators that support native batching can override this
+        method for better performance.
+        """
+        return [self.evaluate(request) for request in requests]
+
+==================================================
+FILE: ./backend/app/evaluation/engine.py
+==================================================
+from app.evaluation.models import (
+    EvaluationRequest,
+    EvaluationSummary,
+)
+from app.evaluation.registry import EvaluatorRegistry
+
+
+class EvaluationEngine:
+    """
+    Executes all registered evaluators.
+    """
+
+    def __init__(self) -> None:
+        self.evaluators = EvaluatorRegistry.get_evaluators()
+
+    def evaluate(
+        self,
+        request: EvaluationRequest,
+    ) -> EvaluationSummary:
+        """
+        Run all evaluators for a single request.
+        """
+
+        summary = EvaluationSummary()
+
+        for evaluator in self.evaluators:
+            result = evaluator.evaluate(request)
+            summary.evaluators.append(result)
+
+        return summary
+
+    def evaluate_batch(
+        self,
+        requests: list[EvaluationRequest],
+    ) -> list[EvaluationSummary]:
+        """
+        Run all evaluators for multiple requests.
+        """
+
+        summaries = [EvaluationSummary() for _ in requests]
+
+        for evaluator in self.evaluators:
+
+            results = evaluator.evaluate_batch(requests)
+
+            if len(results) != len(requests):
+                raise ValueError(
+                    f"{evaluator.__class__.__name__} returned "
+                    f"{len(results)} results for "
+                    f"{len(requests)} requests."
+                )
+
+            for summary, result in zip(
+                summaries,
+                results,
+            ):
+                summary.evaluators.append(result)
+
+        return summaries
+
+==================================================
+FILE: ./backend/app/reports/json_report.py
+==================================================
+import json
+from dataclasses import asdict
+from pathlib import Path
+
+from app.experiments.models import BenchmarkResult
+from app.reports.base import BaseReport
+
+
+class JSONReport(BaseReport):
+    """
+    Export a benchmark result as JSON.
+    """
+
+    def generate(
+        self,
+        result: BenchmarkResult,
+        output_path: str | Path,
+    ) -> None:
+
+        output_path = Path(output_path)
+
+        data = asdict(result)
+
+        data["started_at"] = (
+            result.started_at.isoformat() if result.started_at else None
+        )
+
+        data["completed_at"] = (
+            result.completed_at.isoformat() if result.completed_at else None
+        )
+
+        output_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with output_path.open(
+            "w",
+            encoding="utf-8",
+        ) as file:
+
+            json.dump(
+                data,
+                file,
+                indent=4,
+                ensure_ascii=False,
+            )
+
+==================================================
+FILE: ./backend/app/reports/markdown_report.py
+==================================================
+from pathlib import Path
+
+from app.experiments.models import BenchmarkResult
+from app.reports.base import BaseReport
+
+
+class MarkdownReport(BaseReport):
+    """
+    Export benchmark results as a Markdown report.
+    """
+
+    def generate(
+        self,
+        result: BenchmarkResult,
+        output_path: str | Path,
+    ) -> None:
+
+        output_path = Path(output_path)
+
+        lines: list[str] = []
+
+        lines.append("# Benchmark Report\n\n")
+
+        lines.append(f"**Benchmark ID:** {result.benchmark_id}\n\n")
+
+        lines.append(f"**Dataset:** {result.dataset_name}\n\n")
+
+        lines.append(f"**Dataset Version:** {result.dataset_version}\n\n")
+
+        lines.append(f"**Duration:** {result.duration_ms:.2f} ms\n\n")
+
+        lines.append(f"**Total Samples:** {result.total_samples}\n\n")
+
+        lines.append(f"**Successful:** {result.successful_samples}\n\n")
+
+        lines.append(f"**Failed:** {result.failed_samples}\n\n")
+
+        lines.append(f"**Success Rate:** {result.success_rate:.2%}\n\n")
+
+        lines.append(f"**Failure Rate:** {result.failure_rate:.2%}\n\n")
+
+        lines.append("## Average Scores\n\n")
+
+        if result.average_scores:
+
+            lines.append("| Metric | Score |\n")
+            lines.append("|--------|------:|\n")
+
+            for metric, score in sorted(result.average_scores.items()):
+                lines.append(f"| {metric} | {score:.4f} |\n")
+
+        else:
+            lines.append("_No evaluation metrics available._\n")
+
+        if result.errors:
+
+            lines.append("\n## Errors\n\n")
+
+            for error in result.errors:
+                lines.append(
+                    f"- Sample {error.sample}: "
+                    f"{error.question} "
+                    f"({error.error})\n"
+                )
+
+        output_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        output_path.write_text(
+            "".join(lines),
+            encoding="utf-8",
+        )
+
+==================================================
+FILE: ./backend/app/reports/base.py
+==================================================
+from abc import ABC, abstractmethod
+from pathlib import Path
+
+from app.experiments.models import BenchmarkResult
+
+
+class BaseReport(ABC):
+    """
+    Abstract base class for benchmark report generators.
+    """
+
+    @abstractmethod
+    def generate(
+        self,
+        result: BenchmarkResult,
+        output_path: str | Path,
+    ) -> None:
+        """
+        Generate a report for a benchmark result.
+
+        Args:
+            result: Benchmark execution result.
+            output_path: Destination file path.
+        """
+        raise NotImplementedError
+
+==================================================
+FILE: ./backend/app/reports/csv_report.py
+==================================================
+import csv
+from pathlib import Path
+
+from app.experiments.models import BenchmarkResult
+from app.reports.base import BaseReport
+
+
+class CSVReport(BaseReport):
+    """
+    Export per-sample benchmark results as CSV.
+    """
+
+    def generate(
+        self,
+        result: BenchmarkResult,
+        output_path: str | Path,
+    ) -> None:
+
+        output_path = Path(output_path)
+
+        rows: list[dict[str, float]] = []
+
+        for summary in result.results:
+
+            row: dict[str, float] = {}
+
+            for evaluator in summary.evaluators:
+
+                for metric in evaluator.metrics:
+
+                    row[metric.name] = metric.score
+
+            rows.append(row)
+
+        if not rows:
+            return
+
+        output_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        fieldnames = sorted({key for row in rows for key in row.keys()})
+
+        with output_path.open(
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as csvfile:
+
+            writer = csv.DictWriter(
+                csvfile,
+                fieldnames=fieldnames,
+            )
+
+            writer.writeheader()
+            writer.writerows(rows)
+
+==================================================
+FILE: ./backend/app/reports/__init__.py
+==================================================
+from app.reports.csv_report import CSVReport
+from app.reports.json_report import JSONReport
+from app.reports.markdown_report import MarkdownReport
+
+__all__ = [
+    "CSVReport",
+    "JSONReport",
+    "MarkdownReport",
+]
+
+==================================================
+FILE: ./backend/app/datasets/models.py
+==================================================
+from dataclasses import dataclass, field
+
+
+@dataclass(slots=True)
+class DatasetSample:
+    """
+    Represents a single RAG evaluation sample.
+    """
+
+    question: str
+
+    contexts: list[str]
+
+    answer: str
+
+    ground_truth: str | None = None
+
+    # Which of `contexts` are actually relevant to the question.
+    # Used by retrieval metrics (Precision@K, Recall@K, MRR, MAP,
+    # NDCG, HitRate). Defaults to empty (no retrieval credit) when
+    # not provided by the dataset.
+    relevant_contexts: list[str] = field(default_factory=list)
+
+    metadata: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class Dataset:
+    """
+    Collection of evaluation samples.
+    """
+
+    name: str
+
+    samples: list[DatasetSample] = field(default_factory=list)
+
+    metadata: dict[str, str] = field(default_factory=dict)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def add(
+        self,
+        sample: DatasetSample,
+    ) -> None:
+        self.samples.append(sample)
+
+==================================================
+FILE: ./backend/app/datasets/loader.py
+==================================================
+import json
+from pathlib import Path
+
+from app.datasets.models import Dataset, DatasetSample
+
+
+class DatasetLoader:
+    """
+    Loads evaluation datasets from disk.
+    """
+
+    @staticmethod
+    def load(path: str | Path) -> Dataset:
+        path = Path(path)
+
+        if not path.exists():
+            raise FileNotFoundError(path)
+
+        if path.suffix.lower() != ".json":
+            raise ValueError(f"Unsupported dataset format: {path.suffix}")
+
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        samples = [
+            DatasetSample(
+                question=item["question"],
+                contexts=item["contexts"],
+                answer=item["answer"],
+                ground_truth=item.get("ground_truth"),
+                relevant_contexts=item.get("relevant_contexts", []),
+                metadata=item.get("metadata", {}),
+            )
+            for item in data
+        ]
+
+        return Dataset(
+            name=path.stem,
+            samples=samples,
+        )
+
+==================================================
+FILE: ./backend/app/datasets/validator.py
+==================================================
+from app.datasets.exceptions import DatasetValidationError
+from app.datasets.models import Dataset
+
+
+class DatasetValidator:
+    """
+    Validates Dataset objects before they are used
+    for benchmarking or evaluation.
+    """
+
+    @staticmethod
+    def validate(dataset: Dataset) -> None:
+        """
+        Validate an entire dataset.
+
+        Raises:
+            DatasetValidationError:
+                If any validation rule fails.
+        """
+
+        if dataset is None:
+            raise DatasetValidationError("Dataset cannot be None.")
+
+        if not dataset.name.strip():
+            raise DatasetValidationError("Dataset name cannot be empty.")
+
+        if not dataset.samples:
+            raise DatasetValidationError("Dataset contains no samples.")
+
+        seen_questions: set[str] = set()
+
+        for index, sample in enumerate(
+            dataset.samples,
+            start=1,
+        ):
+
+            # -----------------------------
+            # Question
+            # -----------------------------
+            if not isinstance(sample.question, str):
+                raise DatasetValidationError(
+                    f"Sample #{index}: question must be a string."
+                )
+
+            if not sample.question.strip():
+                raise DatasetValidationError(
+                    f"Sample #{index}: question cannot be empty."
+                )
+
+            # -----------------------------
+            # Duplicate Questions
+            # -----------------------------
+            normalized_question = sample.question.strip().lower()
+
+            if normalized_question in seen_questions:
+                raise DatasetValidationError(
+                    f"Sample #{index}: duplicate question " f"'{sample.question}'."
+                )
+
+            seen_questions.add(normalized_question)
+
+            # -----------------------------
+            # Contexts
+            # -----------------------------
+            if not isinstance(sample.contexts, list):
+                raise DatasetValidationError(
+                    f"Sample #{index}: contexts must be a list."
+                )
+
+            if len(sample.contexts) == 0:
+                raise DatasetValidationError(
+                    f"Sample #{index}: contexts cannot be empty."
+                )
+
+            for context_index, context in enumerate(
+                sample.contexts,
+                start=1,
+            ):
+
+                if not isinstance(context, str):
+                    raise DatasetValidationError(
+                        f"Sample #{index}: "
+                        f"context #{context_index} "
+                        f"must be a string."
+                    )
+
+                if not context.strip():
+                    raise DatasetValidationError(
+                        f"Sample #{index}: "
+                        f"context #{context_index} "
+                        f"cannot be empty."
+                    )
+
+            # -----------------------------
+            # Answer
+            # -----------------------------
+            if not isinstance(sample.answer, str):
+                raise DatasetValidationError(
+                    f"Sample #{index}: answer must be a string."
+                )
+
+            if not sample.answer.strip():
+                raise DatasetValidationError(
+                    f"Sample #{index}: answer cannot be empty."
+                )
+
+            # -----------------------------
+            # Ground Truth
+            # -----------------------------
+            if sample.ground_truth is not None and not isinstance(
+                sample.ground_truth,
+                str,
+            ):
+                raise DatasetValidationError(
+                    f"Sample #{index}: " "ground_truth must be a string " "or None."
+                )
+
+            if isinstance(sample.ground_truth, str) and not sample.ground_truth.strip():
+                raise DatasetValidationError(
+                    f"Sample #{index}: " "ground_truth cannot be empty."
+                )
+
+            # -----------------------------
+            # Metadata
+            # -----------------------------
+            if not isinstance(sample.metadata, dict):
+                raise DatasetValidationError(
+                    f"Sample #{index}: " "metadata must be a dictionary."
+                )
+
+==================================================
+FILE: ./backend/app/datasets/exceptions.py
+==================================================
+class DatasetValidationError(Exception):
+    """Raised when a dataset fails validation."""
+
+    pass
+
+==================================================
+FILE: ./backend/app/metrics/precision.py
+==================================================
+from app.evaluation.models import EvaluationRequest
+from app.metrics.base import BaseMetric
+
+
+class PrecisionAtK(BaseMetric):
+
+    def compute(
+        self,
+        request: EvaluationRequest,
+    ) -> float:
+
+        k = self.config.get("k", len(request.contexts))
+
+        retrieved = request.contexts[:k]
+        relevant = request.relevant_contexts
+
+        if not retrieved:
+            return 0.0
+
+        hits = sum(1 for document in retrieved if document in relevant)
+
+        return hits / len(retrieved)
+
+==================================================
+FILE: ./backend/app/metrics/ndcg.py
+==================================================
+from math import log2
+
+from app.evaluation.models import EvaluationRequest
+from app.metrics.base import BaseMetric
+
+
+class NDCG(BaseMetric):
+
+    def compute(
+        self,
+        request: EvaluationRequest,
+    ) -> float:
+
+        k = self.config.get("k", len(request.contexts))
+
+        retrieved = request.contexts[:k]
+        relevant = request.relevant_contexts
+
+        if not retrieved or not relevant:
+            return 0.0
+
+        # DCG Calculate for nDCG
+        dcg = 0.0
+
+        for rank, document in enumerate(retrieved, start=1):
+            if document in relevant:
+                dcg += 1 / log2(rank + 1)
+
+        ideal_hits = min(len(relevant), k)
+        # Ideal DCG for nDCG
+        idcg = sum(1 / log2(rank + 1) for rank in range(1, ideal_hits + 1))
+
+        if idcg == 0:
+            return 0.0
+
+        return dcg / idcg
+
+==================================================
+FILE: ./backend/app/metrics/faithfulness.py
+==================================================
+import re
+
+from app.evaluation.models import EvaluationRequest
+from app.metrics.base import BaseMetric
+
+_STOPWORDS = {
+    "a",
+    "an",
+    "the",
+    "is",
+    "was",
+    "are",
+    "were",
+    "be",
+    "been",
+    "being",
+    "of",
+    "in",
+    "on",
+    "at",
+    "to",
+    "for",
+    "and",
+    "or",
+    "as",
+    "by",
+    "with",
+    "it",
+    "its",
+    "this",
+    "that",
+    "these",
+    "those",
+    "also",
+    "part",
+    "official",
+}
+
+
+def _content_tokens(text: str) -> set[str]:
+    tokens = set(re.findall(r"[a-z0-9]+", text.lower()))
+    return {token for token in tokens if token not in _STOPWORDS}
+
+
+class Faithfulness(BaseMetric):
+    """
+    Graded faithfulness score: the fraction of the answer's content
+    words that are grounded in the retrieved context. 1.0 means every
+    claim word in the answer is backed by the context; lower scores
+    indicate potentially unsupported (hallucinated) content.
+    """
+
+    def compute(
+        self,
+        request: EvaluationRequest,
+    ) -> float:
+
+        answer_tokens = _content_tokens(request.answer)
+
+        if not answer_tokens:
+            return 0.0
+
+        context_tokens = _content_tokens(" ".join(request.contexts))
+
+        if not context_tokens:
+            return 0.0
+
+        supported = len(answer_tokens & context_tokens)
+
+        return round(supported / len(answer_tokens), 4)
+
+==================================================
+FILE: ./backend/app/metrics/semantic_similarity.py
+==================================================
+import re
+
+from app.evaluation.models import EvaluationRequest
+from app.metrics.base import BaseMetric
+
+
+def _tokenize(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+class SemanticSimilarity(BaseMetric):
+    """
+    Cosine similarity between the answer and ground truth embeddings.
+
+    Loads a sentence-transformers model lazily on first use. If the
+    model can't be loaded (no internet access, dependency not
+    installed, etc.) this degrades gracefully to a Jaccard
+    token-overlap similarity, so the evaluation pipeline still runs
+    end to end in offline / demo environments.
+    """
+
+    _model = None
+    _model_load_failed = False
+
+    def __init__(self, **config):
+        super().__init__(**config)
+        self.model_name = config.get("model_name", "all-MiniLM-L6-v2")
+
+    def compute(
+        self,
+        request: EvaluationRequest,
+    ) -> float:
+
+        if not request.ground_truth:
+            return 0.0
+
+        model = self._get_model(self.model_name)
+
+        if model is not None:
+            try:
+                from sentence_transformers.util import cos_sim
+
+                answer_embedding = model.encode(
+                    request.answer,
+                    convert_to_tensor=True,
+                )
+
+                truth_embedding = model.encode(
+                    request.ground_truth,
+                    convert_to_tensor=True,
+                )
+
+                similarity = cos_sim(
+                    answer_embedding,
+                    truth_embedding,
+                )
+
+                return round(float(similarity.item()), 4)
+
+            except Exception:
+                # Fall through to the lexical fallback below.
+                pass
+
+        return self._lexical_similarity(
+            request.answer,
+            request.ground_truth,
+        )
+
+    @classmethod
+    def _get_model(cls, model_name: str):
+        if cls._model is not None:
+            return cls._model
+
+        if cls._model_load_failed:
+            return None
+
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            cls._model = SentenceTransformer(model_name)
+
+            return cls._model
+
+        except Exception:
+            cls._model_load_failed = True
+            return None
+
+    @staticmethod
+    def _lexical_similarity(answer: str, ground_truth: str) -> float:
+        answer_tokens = _tokenize(answer)
+        truth_tokens = _tokenize(ground_truth)
+
+        if not answer_tokens or not truth_tokens:
+            return 0.0
+
+        intersection = len(answer_tokens & truth_tokens)
+        union = len(answer_tokens | truth_tokens)
+
+        return round(intersection / union, 4) if union else 0.0
+
+==================================================
+FILE: ./backend/app/metrics/map.py
+==================================================
+from app.evaluation.models import EvaluationRequest
+from app.metrics.base import BaseMetric
+
+
+class MAP(BaseMetric):
+
+    def compute(
+        self,
+        request: EvaluationRequest,
+    ) -> float:
+
+        k = self.config.get("k", len(request.contexts))
+
+        retrieved = request.contexts[:k]
+        relevant = set(request.relevant_contexts)
+
+        if not retrieved or not relevant:
+            return 0.0
+
+        hits = 0
+        precision_sum = 0.0
+
+        for rank, document in enumerate(retrieved, start=1):
+            if document in relevant:
+                hits += 1
+                precision_sum += hits / rank
+
+        if hits == 0:
+            return 0.0
+
+        return precision_sum / min(len(relevant), k)
+
+==================================================
+FILE: ./backend/app/metrics/recall.py
+==================================================
+from app.evaluation.models import EvaluationRequest
+from app.metrics.base import BaseMetric
+
+
+class RecallAtK(BaseMetric):
+
+    def compute(
+        self,
+        request: EvaluationRequest,
+    ) -> float:
+
+        k = self.config.get("k", len(request.contexts))
+
+        retrieved = request.contexts[:k]
+        relevant = request.relevant_contexts
+
+        if not relevant:
+            return 0.0
+
+        hits = sum(1 for document in retrieved if document in relevant)
+
+        return hits / len(relevant)
+
+==================================================
+FILE: ./backend/app/metrics/correctness.py
+==================================================
+from app.evaluation.models import EvaluationRequest
+from app.metrics.base import BaseMetric
+
+
+class Correctness(BaseMetric):
+
+    def compute(
+        self,
+        request: EvaluationRequest,
+    ) -> float:
+
+        if not request.ground_truth:
+            return 0.0
+
+        answer = request.answer.strip().lower()
+        ground_truth = request.ground_truth.strip().lower()
+
+        if answer == ground_truth:
+            return 1.0
+
+        return 0.0
+
+==================================================
+FILE: ./backend/app/metrics/base.py
+==================================================
+from abc import ABC, abstractmethod
+
+from app.evaluation.models import EvaluationRequest
+
+
+class BaseMetric(ABC):
+
+    def __init__(self, **config):
+        self.config = config
+
+    @abstractmethod
+    def compute(
+        self,
+        request: EvaluationRequest,
+    ) -> float:
+        pass
+
+==================================================
+FILE: ./backend/app/metrics/mrr.py
+==================================================
+from app.evaluation.models import EvaluationRequest
+from app.metrics.base import BaseMetric
+
+
+class MRR(BaseMetric):
+
+    def compute(
+        self,
+        request: EvaluationRequest,
+    ) -> float:
+
+        for rank, document in enumerate(
+            request.contexts,
+            start=1,
+        ):
+            if document in request.relevant_contexts:
+                return 1 / rank
+
+        return 0.0
+
+==================================================
+FILE: ./backend/app/metrics/__init__.py
+==================================================
+from app.metrics.precision import PrecisionAtK
+from app.metrics.recall import RecallAtK
+
+==================================================
+FILE: ./backend/app/metrics/hit_rate.py
+==================================================
+from app.evaluation.models import EvaluationRequest
+from app.metrics.base import BaseMetric
+
+
+class HitRate(BaseMetric):
+
+    def compute(
+        self,
+        request: EvaluationRequest,
+    ) -> float:
+
+        for document in request.contexts:
+            if document in request.relevant_contexts:
+                return 1.0
+
+        return 0.0
+
+==================================================
+FILE: ./backend/app/core/config.py
+==================================================
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    # Application
+    APP_NAME: str = "RAG Evaluation Platform"
+    APP_VERSION: str = "1.0.0"
+    DEBUG: bool = False
+
+    # Database
+    # Defaults to a local SQLite file so the platform can be demoed with
+    # zero external services. Point DATABASE_URL at Postgres (see
+    # docker-compose.yml) for a production-style deployment.
+    DATABASE_URL: str = "sqlite:///./rag_eval.db"
+
+    # LLM
+    # "mock" runs a deterministic, offline heuristic judge so the full
+    # pipeline works without any API key. Set LLM_PROVIDER=gemini and
+    # provide GEMINI_API_KEY to use a real LLM-as-judge.
+    LLM_PROVIDER: str = "mock"
+
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-flash-latest"
+
+    # Number of evaluation requests sent in a single LLM call.
+    LLM_BATCH_SIZE: int = 10
+
+    # CORS - comma separated list of allowed origins, "*" for all.
+    CORS_ORIGINS: str = "*"
+
+    # Reports
+    REPORTS_DIR: str = "reports"
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",
+    )
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        if self.CORS_ORIGINS.strip() == "*":
+            return ["*"]
+
+        return [
+            origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()
+        ]
+
+
+settings = Settings()
+
+==================================================
+FILE: ./backend/app/llm/mock.py
+==================================================
+import json
+import re
+
+from app.llm.base import BaseLLMClient
+
+
+def _tokenize(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+class MockLLMClient(BaseLLMClient):
+    """
+    Deterministic, offline stand-in for a real LLM judge.
+
+    Scores are derived from lexical overlap between the generated
+    answer and the retrieved context / question, so the platform
+    produces sensible, reproducible results without any network
+    access or API key. Swap LLM_PROVIDER to "gemini" (with
+    GEMINI_API_KEY set) for real LLM-as-judge scoring.
+    """
+
+    def evaluate(self, prompt: str) -> str:
+        question, context, answer = self._extract_sections(prompt)
+
+        answer_tokens = _tokenize(answer)
+        context_tokens = _tokenize(context)
+        question_tokens = _tokenize(question)
+
+        faithfulness = self._overlap_ratio(
+            answer_tokens,
+            context_tokens,
+        )
+
+        answer_relevance = self._overlap_ratio(
+            answer_tokens,
+            question_tokens,
+            floor=0.35,
+        )
+
+        hallucination = round(
+            max(0.0, min(1.0, 1.0 - faithfulness)),
+            4,
+        )
+
+        reason = (
+            "Heuristic mock judge: answer shares "
+            f"{round(faithfulness * 100)}% of its key terms "
+            "with the retrieved context."
+        )
+
+        return json.dumps(
+            {
+                "faithfulness": faithfulness,
+                "answer_relevance": answer_relevance,
+                "hallucination": hallucination,
+                "reason": reason,
+            }
+        )
+
+    @staticmethod
+    def _extract_sections(prompt: str) -> tuple[str, str, str]:
+        question_match = re.search(r"Question:\s*(.*?)\n\n", prompt, re.DOTALL)
+        context_match = re.search(r"Retrieved Context:\s*(.*?)\n\n", prompt, re.DOTALL)
+        answer_match = re.search(r"Generated Answer:\s*(.*?)\n\n", prompt, re.DOTALL)
+
+        question = question_match.group(1).strip() if question_match else ""
+        context = context_match.group(1).strip() if context_match else ""
+        answer = answer_match.group(1).strip() if answer_match else ""
+
+        return question, context, answer
+
+    @staticmethod
+    def _overlap_ratio(
+        answer_tokens: set[str],
+        reference_tokens: set[str],
+        floor: float = 0.05,
+    ) -> float:
+        if not answer_tokens or not reference_tokens:
+            return floor
+
+        overlap = len(answer_tokens & reference_tokens)
+        ratio = overlap / len(answer_tokens)
+
+        # Blend toward a high score for strong overlap while keeping
+        # a realistic floor so scores aren't a flat 0/1 distribution.
+        score = floor + (1 - floor) * ratio
+
+        return round(max(0.0, min(1.0, score)), 4)
+
+==================================================
+FILE: ./backend/app/llm/client.py
+==================================================
+from app.core.config import settings
+from app.llm.base import BaseLLMClient
+from app.llm.mock import MockLLMClient
+
+
+class LLMClient:
+    """Factory for selecting the configured LLM provider."""
+
+    _PROVIDERS: dict[str, type[BaseLLMClient]] = {
+        "mock": MockLLMClient,
+    }
+
+    def __init__(self) -> None:
+        provider = settings.LLM_PROVIDER.lower()
+
+        if provider == "gemini":
+            # Imported lazily: the google-genai SDK is an optional,
+            # heavier dependency only needed when a real LLM judge
+            # is configured.
+            from app.llm.gemini import GeminiClient
+
+            self._PROVIDERS.setdefault("gemini", GeminiClient)
+
+        try:
+            self.client = self._PROVIDERS[provider]()
+        except KeyError as exc:
+            supported = ", ".join(sorted(self._PROVIDERS.keys()))
+            raise ValueError(
+                f"Unsupported LLM provider '{provider}'. "
+                f"Supported providers: {supported}"
+            ) from exc
+
+    def evaluate(
+        self,
+        prompt: str,
+    ) -> str:
+        return self.client.evaluate(prompt)
+
+==================================================
+FILE: ./backend/app/llm/parser.py
+==================================================
+import json
+import re
+
+
+class LLMResponseParser:
+
+    REQUIRED_FIELDS = (
+        "faithfulness",
+        "answer_relevance",
+        "hallucination",
+        "reason",
+    )
+
+    @staticmethod
+    def parse(response: str) -> dict:
+        """
+        Parse an LLM response into a validated dictionary.
+        """
+
+        response = response.strip()
+
+        # Remove markdown code fences
+        response = re.sub(r"^```(?:json)?", "", response)
+        response = re.sub(r"```$", "", response)
+        response = response.strip()
+
+        # Extract first JSON object
+        match = re.search(r"\{.*\}", response, re.DOTALL)
+
+        if not match:
+            raise ValueError("No JSON object found.")
+
+        data = json.loads(match.group())
+
+        # Validate required fields
+        for field in LLMResponseParser.REQUIRED_FIELDS:
+            if field not in data:
+                raise ValueError(f"Missing field: {field}")
+
+        return data
+
+    @staticmethod
+    def parse_batch(response: str) -> list[dict]:
+        """
+        Parse a batch LLM response into a validated list of dictionaries.
+        """
+
+        response = response.strip()
+
+        # Remove markdown code fences
+        response = re.sub(r"^```(?:json)?", "", response)
+        response = re.sub(r"```$", "", response)
+        response = response.strip()
+
+        # Extract JSON array
+        match = re.search(r"\[.*\]", response, re.DOTALL)
+
+        if not match:
+            raise ValueError("No JSON array found.")
+
+        data = json.loads(match.group())
+
+        if not isinstance(data, list):
+            raise ValueError("Expected a JSON array.")
+
+        for index, item in enumerate(data):
+
+            if not isinstance(item, dict):
+                raise ValueError(f"Item {index} is not a JSON object.")
+
+            for field in LLMResponseParser.REQUIRED_FIELDS:
+                if field not in item:
+                    raise ValueError(f"Item {index} missing field: {field}")
+
+        return data
+
+==================================================
+FILE: ./backend/app/llm/base.py
+==================================================
+from abc import ABC, abstractmethod
+
+
+class BaseLLMClient(ABC):
+
+    @abstractmethod
+    def evaluate(
+        self,
+        prompt: str,
+    ) -> str:
+        """Evaluate a prompt and return the raw LLM response."""
+        pass
+
+==================================================
+FILE: ./backend/app/llm/gemini.py
+==================================================
+from google import genai
+from google.genai import types
+
+from app.core.config import settings
+from app.llm.base import BaseLLMClient
+
+
+class GeminiClient(BaseLLMClient):
+    """Gemini implementation of the LLM client."""
+
+    def __init__(self) -> None:
+        self.client = genai.Client(
+            api_key=settings.GEMINI_API_KEY,
+        )
+        self.model = settings.GEMINI_MODEL
+
+    def evaluate(
+        self,
+        prompt: str,
+    ) -> str:
+        """
+        Generate an evaluation response from Gemini.
+
+        Args:
+            prompt: Prompt sent to the model.
+
+        Returns:
+            The model response as plain text.
+
+        Raises:
+            RuntimeError: If Gemini returns an empty response.
+            Exception: Propagates SDK/API errors.
+        """
+        if not prompt.strip():
+            raise ValueError("Prompt cannot be empty.")
+
+        try:
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    response_mime_type="application/json",
+                ),
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Gemini request failed: {exc}") from exc
+
+        if not response.text:
+            raise RuntimeError("Gemini returned an empty response.")
+
+        return response.text
+
+    def health_check(self) -> bool:
+        """
+        Verify that the configured model is reachable.
+
+        Returns:
+            True if the model responds successfully.
+        """
+        try:
+            self.client.models.generate_content(
+                model=self.model,
+                contents="ping",
+            )
+            return True
+        except Exception:
+            return False
+
+==================================================
+FILE: ./backend/app/main.py
+==================================================
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.api.routes.benchmarks import router as benchmark_router
+from app.api.routes.datasets import router as dataset_router
+from app.api.routes.experiments import router as experiment_router
+from app.api.routes.leaderboard import router as leaderboard_router
+from app.api.routes.projects import router as project_router
+from app.api.routes.reports import router as report_router
+from app.api.routes.summary import router as summary_router
+from app.core.config import settings
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+)
+
+# Allow the static dashboard (served from a different origin/port,
+# e.g. http://localhost:5500) to call this API.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins_list,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Register API Routers
+app.include_router(project_router)
+app.include_router(dataset_router)
+app.include_router(experiment_router)
+app.include_router(benchmark_router)
+app.include_router(report_router)
+app.include_router(leaderboard_router)
+app.include_router(summary_router)
+
+
+@app.get("/", tags=["Root"])
+def root():
+    return {
+        "app": settings.APP_NAME,
+        "version": settings.APP_VERSION,
+        "status": "Running",
+    }
+
+
+@app.get("/health", tags=["Health"])
+def health():
+    return {
+        "status": "healthy",
+    }
+
+==================================================
+FILE: ./backend/app/api/routes/datasets.py
+==================================================
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.models.dataset import Dataset
+
+router = APIRouter(
+    prefix="/datasets",
+    tags=["Datasets"],
+)
+
+
+@router.post("/", status_code=status.HTTP_201_CREATED)
+def create_dataset(
+    project_id: int,
+    name: str,
+    version: str = "1.0",
+    file_path: str = "",
+    db: Session = Depends(get_db),
+):
+    dataset = Dataset(
+        project_id=project_id,
+        name=name,
+        version=version,
+        file_path=file_path,
+    )
+
+    db.add(dataset)
+    db.commit()
+    db.refresh(dataset)
+
+    return dataset
+
+
+@router.get("/")
+def list_datasets(
+    db: Session = Depends(get_db),
+):
+    return db.scalars(select(Dataset)).all()
+
+
+@router.get("/{dataset_id}")
+def get_dataset(
+    dataset_id: int,
+    db: Session = Depends(get_db),
+):
+    dataset = db.get(Dataset, dataset_id)
+
+    if dataset is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Dataset not found",
+        )
+
+    return dataset
+
+
+@router.delete("/{dataset_id}")
+def delete_dataset(
+    dataset_id: int,
+    db: Session = Depends(get_db),
+):
+    dataset = db.get(Dataset, dataset_id)
+
+    if dataset is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Dataset not found",
+        )
+
+    db.delete(dataset)
+    db.commit()
+
+    return {
+        "message": "Dataset deleted successfully",
+    }
+
+==================================================
+FILE: ./backend/app/api/routes/experiments.py
+==================================================
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.models.experiment import Experiment
+
+router = APIRouter(
+    prefix="/experiments",
+    tags=["Experiments"],
+)
+
+
+@router.post("/", status_code=status.HTTP_201_CREATED)
+def create_experiment(
+    project_id: int,
+    name: str,
+    description: str | None = None,
+    db: Session = Depends(get_db),
+):
+    experiment = Experiment(
+        project_id=project_id,
+        name=name,
+        description=description,
+    )
+
+    db.add(experiment)
+    db.commit()
+    db.refresh(experiment)
+
+    return experiment
+
+
+@router.get("/")
+def list_experiments(
+    db: Session = Depends(get_db),
+):
+    return db.scalars(select(Experiment)).all()
+
+
+@router.get("/{experiment_id}")
+def get_experiment(
+    experiment_id: int,
+    db: Session = Depends(get_db),
+):
+    experiment = db.get(Experiment, experiment_id)
+
+    if experiment is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Experiment not found",
+        )
+
+    return experiment
+
+
+@router.delete("/{experiment_id}")
+def delete_experiment(
+    experiment_id: int,
+    db: Session = Depends(get_db),
+):
+    experiment = db.get(Experiment, experiment_id)
+
+    if experiment is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Experiment not found",
+        )
+
+    db.delete(experiment)
+    db.commit()
+
+    return {
+        "message": "Experiment deleted successfully",
+    }
+
+==================================================
+FILE: ./backend/app/api/routes/summary.py
+==================================================
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.models.benchmark import Benchmark
+from app.models.dataset import Dataset
+from app.models.evaluation import Evaluation
+from app.models.experiment import Experiment
+from app.models.metric import Metric
+from app.models.project import Project
+
+router = APIRouter(
+    tags=["Summary"],
+)
+
+
+@router.get("/summary")
+def dashboard_summary(
+    db: Session = Depends(get_db),
+):
+    """
+    Aggregate counts and headline metrics for the dashboard's
+    top-level overview cards.
+    """
+
+    projects = db.scalar(select(func.count(Project.id)))
+    datasets = db.scalar(select(func.count(Dataset.id)))
+    experiments = db.scalar(select(func.count(Experiment.id)))
+    benchmarks = db.scalar(select(func.count(Benchmark.id)))
+    evaluations = db.scalar(select(func.count(Evaluation.id)))
+    average_score = db.scalar(select(func.avg(Metric.score)))
+
+    metric_rows = db.execute(
+        select(
+            Metric.name,
+            func.avg(Metric.score).label("avg_score"),
+            func.count(Metric.id).label("count"),
+        ).group_by(Metric.name)
+    ).all()
+
+    metric_averages = {row.name: round(float(row.avg_score), 4) for row in metric_rows}
+
+    latest_benchmark = db.scalar(select(Benchmark).order_by(Benchmark.id.desc()))
+
+    return {
+        "projects": projects or 0,
+        "datasets": datasets or 0,
+        "experiments": experiments or 0,
+        "benchmarks": benchmarks or 0,
+        "evaluations": evaluations or 0,
+        "average_score": (
+            round(float(average_score), 4) if average_score is not None else 0.0
+        ),
+        "metric_averages": metric_averages,
+        "latest_benchmark": (
+            {
+                "id": latest_benchmark.id,
+                "name": latest_benchmark.name,
+                "status": latest_benchmark.status,
+                "completed_at": (
+                    latest_benchmark.completed_at.isoformat()
+                    if latest_benchmark.completed_at
+                    else None
+                ),
+            }
+            if latest_benchmark is not None
+            else None
+        ),
+    }
+
+
+@router.get("/benchmarks/{benchmark_id}/metrics")
+def benchmark_metrics(
+    benchmark_id: int,
+    db: Session = Depends(get_db),
+):
+    """
+    Per-metric averages for a single benchmark run, used to
+    render retrieval/generation breakdowns and run comparisons.
+    """
+
+    benchmark = db.get(Benchmark, benchmark_id)
+
+    if benchmark is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Benchmark not found",
+        )
+
+    rows = db.execute(
+        select(
+            Metric.name,
+            func.avg(Metric.score).label("avg_score"),
+            func.count(Metric.id).label("count"),
+        )
+        .join(Evaluation, Evaluation.id == Metric.evaluation_id)
+        .where(Evaluation.benchmark_id == benchmark_id)
+        .group_by(Metric.name)
+    ).all()
+
+    evaluation_count = db.scalar(
+        select(func.count(Evaluation.id)).where(Evaluation.benchmark_id == benchmark_id)
+    )
+
+    return {
+        "benchmark_id": benchmark.id,
+        "benchmark_name": benchmark.name,
+        "status": benchmark.status,
+        "evaluations": evaluation_count or 0,
+        "metrics": {row.name: round(float(row.avg_score), 4) for row in rows},
+    }
+
+
+@router.get("/benchmarks/{benchmark_id}/evaluations")
+def benchmark_evaluations(
+    benchmark_id: int,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+):
+    """
+    Per-sample evaluations with their metric scores, for the
+    dashboard's drill-down table.
+    """
+
+    benchmark = db.get(Benchmark, benchmark_id)
+
+    if benchmark is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Benchmark not found",
+        )
+
+    evaluations = db.scalars(
+        select(Evaluation)
+        .where(Evaluation.benchmark_id == benchmark_id)
+        .order_by(Evaluation.id)
+        .limit(limit)
+    ).all()
+
+    results = []
+
+    for evaluation in evaluations:
+        metrics = db.scalars(
+            select(Metric).where(Metric.evaluation_id == evaluation.id)
+        ).all()
+
+        results.append(
+            {
+                "id": evaluation.id,
+                "query": evaluation.query,
+                "answer": evaluation.answer,
+                "ground_truth": evaluation.ground_truth,
+                "metrics": {metric.name: round(metric.score, 4) for metric in metrics},
+            }
+        )
+
+    return results
+
+==================================================
+FILE: ./backend/app/api/routes/projects.py
+==================================================
+from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.models.project import Project
+
+router = APIRouter(
+    prefix="/projects",
+    tags=["Projects"],
+)
+
+
+@router.post("/", status_code=status.HTTP_201_CREATED)
+def create_project(
+    name: str,
+    description: str | None = None,
+    db: Session = Depends(get_db),
+):
+    project = Project(
+        name=name,
+        description=description,
+    )
+
+    db.add(project)
+    db.commit()
+    db.refresh(project)
+
+    return project
+
+
+@router.get("/")
+def list_projects(
+    db: Session = Depends(get_db),
+):
+    return db.scalars(select(Project)).all()
+
+
+@router.get("/{project_id}")
+def get_project(
+    project_id: int,
+    db: Session = Depends(get_db),
+):
+    project = db.get(Project, project_id)
+
+    if project is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found",
+        )
+
+    return project
+
+
+@router.put("/{project_id}")
+def update_project(
+    project_id: int,
+    name: str,
+    description: str | None = None,
+    db: Session = Depends(get_db),
+):
+    project = db.get(Project, project_id)
+
+    if project is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found",
+        )
+
+    project.name = name
+    project.description = description
+
+    db.commit()
+    db.refresh(project)
+
+    return project
+
+
+@router.delete("/{project_id}")
+def delete_project(
+    project_id: int,
+    db: Session = Depends(get_db),
+):
+    project = db.get(Project, project_id)
+
+    if project is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found",
+        )
+
+    db.delete(project)
+    db.commit()
+
+    return {
+        "message": "Project deleted successfully",
+    }
+
+==================================================
+FILE: ./backend/app/api/routes/leaderboard.py
+==================================================
+from fastapi import APIRouter, Depends
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.models.project import Project
+from app.models.experiment import Experiment
+from app.models.benchmark import Benchmark
+from app.models.evaluation import Evaluation
+from app.models.metric import Metric
+
+router = APIRouter(
+    prefix="/leaderboard",
+    tags=["Leaderboard"],
+)
+
+
+@router.get("/")
+def leaderboard(
+    db: Session = Depends(get_db),
+):
+    stmt = (
+        select(
+            Project.name.label("project"),
+            Experiment.name.label("experiment"),
+            Benchmark.id.label("benchmark_id"),
+            Benchmark.name.label("benchmark"),
+            Benchmark.status.label("status"),
+            func.count(func.distinct(Evaluation.id)).label("evaluations"),
+            func.avg(Metric.score).label("overall_score"),
+        )
+        .join(
+            Experiment,
+            Experiment.project_id == Project.id,
+        )
+        .join(
+            Benchmark,
+            Benchmark.experiment_id == Experiment.id,
+        )
+        .outerjoin(
+            Evaluation,
+            Evaluation.benchmark_id == Benchmark.id,
+        )
+        .outerjoin(
+            Metric,
+            Metric.evaluation_id == Evaluation.id,
+        )
+        .group_by(
+            Project.name,
+            Experiment.name,
+            Benchmark.id,
+            Benchmark.name,
+            Benchmark.status,
+        )
+        .order_by(func.avg(Metric.score).desc().nullslast())
+    )
+
+    rows = db.execute(stmt).all()
+
+    results = []
+
+    for rank, row in enumerate(rows, start=1):
+        results.append(
+            {
+                "rank": rank,
+                "project": row.project,
+                "experiment": row.experiment,
+                "benchmark_id": row.benchmark_id,
+                "benchmark": row.benchmark,
+                "status": row.status,
+                "evaluations": row.evaluations,
+                "overall_score": (
+                    round(float(row.overall_score), 4)
+                    if row.overall_score is not None
+                    else 0.0
+                ),
+            }
+        )
+
+    return results
+
+==================================================
+FILE: ./backend/app/api/routes/benchmarks.py
+==================================================
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.models.benchmark import Benchmark
+
+router = APIRouter(
+    prefix="/benchmarks",
+    tags=["Benchmarks"],
+)
+
+
+@router.post("/", status_code=status.HTTP_201_CREATED)
+def create_benchmark(
+    experiment_id: int,
+    name: str,
+    db: Session = Depends(get_db),
+):
+    benchmark = Benchmark(
+        experiment_id=experiment_id,
+        name=name,
+        status="pending",
+    )
+
+    db.add(benchmark)
+    db.commit()
+    db.refresh(benchmark)
+
+    return benchmark
+
+
+@router.get("/")
+def list_benchmarks(
+    db: Session = Depends(get_db),
+):
+    return db.scalars(select(Benchmark)).all()
+
+
+@router.get("/{benchmark_id}")
+def get_benchmark(
+    benchmark_id: int,
+    db: Session = Depends(get_db),
+):
+    benchmark = db.get(Benchmark, benchmark_id)
+
+    if benchmark is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Benchmark not found",
+        )
+
+    return benchmark
+
+
+@router.patch("/{benchmark_id}/status")
+def update_benchmark_status(
+    benchmark_id: int,
+    status_value: str,
+    db: Session = Depends(get_db),
+):
+    benchmark = db.get(Benchmark, benchmark_id)
+
+    if benchmark is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Benchmark not found",
+        )
+
+    benchmark.status = status_value
+
+    db.commit()
+    db.refresh(benchmark)
+
+    return benchmark
+
+
+@router.delete("/{benchmark_id}")
+def delete_benchmark(
+    benchmark_id: int,
+    db: Session = Depends(get_db),
+):
+    benchmark = db.get(Benchmark, benchmark_id)
+
+    if benchmark is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Benchmark not found",
+        )
+
+    db.delete(benchmark)
+    db.commit()
+
+    return {
+        "message": "Benchmark deleted successfully",
+    }
+
+==================================================
+FILE: ./backend/app/api/routes/reports.py
+==================================================
+from pathlib import Path
+
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
+
+router = APIRouter(
+    prefix="/reports",
+    tags=["Reports"],
+)
+
+
+def _serve_report(benchmark_id: int, extension: str, media_type: str):
+    path = Path(f"reports/benchmark_{benchmark_id}.{extension}")
+
+    if not path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Report not found",
+        )
+
+    return FileResponse(
+        path=path,
+        filename=path.name,
+        media_type=media_type,
+    )
+
+
+@router.get("/{benchmark_id}/json")
+def json_report(benchmark_id: int):
+    return _serve_report(benchmark_id, "json", "application/json")
+
+
+@router.get("/{benchmark_id}/csv")
+def csv_report(benchmark_id: int):
+    return _serve_report(benchmark_id, "csv", "text/csv")
+
+
+@router.get("/{benchmark_id}/markdown")
+def markdown_report(benchmark_id: int):
+    return _serve_report(benchmark_id, "md", "text/markdown")
+
+==================================================
+FILE: ./backend/app/models/metric.py
+==================================================
+from sqlalchemy import Float, ForeignKey, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base
+
+
+class Metric(Base):
+    __tablename__ = "metrics"
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True,
+        index=True,
+    )
+
+    evaluation_id: Mapped[int] = mapped_column(
+        ForeignKey("evaluations.id"),
+        nullable=False,
+    )
+
+    name: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+
+    score: Mapped[float] = mapped_column(
+        Float,
+        nullable=False,
+    )
+
+==================================================
+FILE: ./backend/app/models/project.py
+==================================================
+from datetime import datetime
+
+from sqlalchemy import DateTime, String, func
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base
+
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True,
+        index=True,
+    )
+
+    name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+
+    description: Mapped[str | None] = mapped_column(
+        String,
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+==================================================
+FILE: ./backend/app/models/benchmark.py
+==================================================
+from datetime import datetime
+
+from sqlalchemy import DateTime, ForeignKey, String, func
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base
+
+
+class Benchmark(Base):
+    __tablename__ = "benchmarks"
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True,
+        index=True,
+    )
+
+    experiment_id: Mapped[int] = mapped_column(
+        ForeignKey("experiments.id"),
+        nullable=False,
+    )
+
+    name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(20),
+        default="pending",
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+==================================================
+FILE: ./backend/app/models/dataset.py
+==================================================
+from datetime import datetime
+
+from sqlalchemy import DateTime, ForeignKey, String, func
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base
+
+
+class Dataset(Base):
+    __tablename__ = "datasets"
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True,
+        index=True,
+    )
+
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("projects.id"),
+        nullable=False,
+    )
+
+    name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+
+    version: Mapped[str] = mapped_column(
+        String(50),
+        default="1.0",
+    )
+
+    file_path: Mapped[str] = mapped_column(
+        String(500),
+        nullable=False,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+==================================================
+FILE: ./backend/app/models/evaluation.py
+==================================================
+from sqlalchemy import ForeignKey, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base
+
+
+class Evaluation(Base):
+    __tablename__ = "evaluations"
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True,
+        index=True,
+    )
+
+    benchmark_id: Mapped[int] = mapped_column(
+        ForeignKey("benchmarks.id"),
+        nullable=False,
+    )
+
+    query: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    answer: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+
+    ground_truth: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+==================================================
+FILE: ./backend/app/models/__init__.py
+==================================================
+from app.models.benchmark import Benchmark
+from app.models.dataset import Dataset
+from app.models.evaluation import Evaluation
+from app.models.experiment import Experiment
+from app.models.metric import Metric
+from app.models.project import Project
+
+__all__ = [
+    "Project",
+    "Dataset",
+    "Experiment",
+    "Benchmark",
+    "Evaluation",
+    "Metric",
+]
+
+==================================================
+FILE: ./backend/app/models/experiment.py
+==================================================
+from datetime import datetime
+
+from sqlalchemy import DateTime, ForeignKey, String, func
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db.base import Base
+
+
+class Experiment(Base):
+    __tablename__ = "experiments"
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True,
+        index=True,
+    )
+
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("projects.id"),
+        nullable=False,
+    )
+
+    name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+
+    description: Mapped[str | None] = mapped_column(
+        String,
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+==================================================
+FILE: ./backend/run_demo.sh
+==================================================
+#!/bin/bash
+set -e
+
+echo "======================================"
+echo " RAG Evaluation Platform Demo"
+echo "======================================"
+
+echo "[1/3] Running the full evaluation pipeline..."
+python scripts/run_evaluation.py
+
+echo ""
+echo "[2/3] Leaderboard"
+curl -s http://127.0.0.1:8000/leaderboard/ | python3 -m json.tool || echo "(start the API with: uvicorn app.main:app --reload  --to see this live)"
+
+echo ""
+echo "[3/3] Done. Open:"
+echo "  API docs:  http://localhost:8000/docs"
+echo "  Dashboard: http://localhost:5500  (cd frontend && python3 -m http.server 5500)"
+
+==================================================
+FILE: ./backend/tests/test_reports.py
+==================================================
+import csv
+import json
+
+from app.datasets.loader import DatasetLoader
+from app.experiments.benchmark import BenchmarkRunner
+from app.reports import CSVReport, JSONReport, MarkdownReport
+
+
+def run_small_benchmark(sample_dataset_path):
+    dataset = DatasetLoader.load(sample_dataset_path)
+    return BenchmarkRunner().run(dataset)
+
+
+def test_json_report_contains_average_scores(tmp_path, sample_dataset_path):
+    result = run_small_benchmark(sample_dataset_path)
+    out = tmp_path / "report.json"
+
+    JSONReport().generate(result, out)
+
+    assert out.exists()
+    data = json.loads(out.read_text())
+    assert data["dataset_name"] == result.dataset_name
+    assert data["total_samples"] == result.total_samples
+    assert set(data["average_scores"]) == set(result.average_scores)
+
+
+def test_csv_report_has_one_row_per_sample(tmp_path, sample_dataset_path):
+    result = run_small_benchmark(sample_dataset_path)
+    out = tmp_path / "report.csv"
+
+    CSVReport().generate(result, out)
+
+    assert out.exists()
+    with out.open() as f:
+        rows = list(csv.DictReader(f))
+
+    assert len(rows) == result.total_samples
+
+
+def test_markdown_report_includes_metric_table(tmp_path, sample_dataset_path):
+    result = run_small_benchmark(sample_dataset_path)
+    out = tmp_path / "report.md"
+
+    MarkdownReport().generate(result, out)
+
+    content = out.read_text()
+    assert "# Benchmark Report" in content
+    assert "## Average Scores" in content
+    for metric_name in result.average_scores:
+        assert metric_name in content
+
+==================================================
+FILE: ./backend/tests/test_benchmark.py
+==================================================
+from app.datasets.loader import DatasetLoader
+from app.experiments.benchmark import BenchmarkRunner
+
+
+def test_benchmark_runner_evaluates_every_sample(sample_dataset_path):
+    dataset = DatasetLoader.load(sample_dataset_path)
+    runner = BenchmarkRunner()
+
+    result = runner.run(dataset)
+
+    assert result.dataset_name == dataset.name
+    assert result.total_samples == len(dataset)
+    assert result.successful_samples == len(dataset)
+    assert result.failed_samples == 0
+    assert result.is_successful is True
+    assert result.success_rate == 1.0
+
+
+def test_benchmark_runner_computes_average_scores(sample_dataset_path):
+    dataset = DatasetLoader.load(sample_dataset_path)
+    runner = BenchmarkRunner()
+
+    result = runner.run(dataset)
+
+    expected_metrics = {
+        "precision@2",
+        "recall@2",
+        "mrr",
+        "hit_rate",
+        "ndcg@2",
+        "map@2",
+        "faithfulness",
+        "correctness",
+        "semantic_similarity",
+        "llm_faithfulness",
+        "answer_relevance",
+        "hallucination",
+    }
+
+    assert expected_metrics.issubset(result.average_scores.keys())
+
+    for score in result.average_scores.values():
+        assert 0.0 <= score <= 1.0
+
+
+def test_benchmark_runner_tracks_duration(sample_dataset_path):
+    dataset = DatasetLoader.load(sample_dataset_path)
+    result = BenchmarkRunner().run(dataset)
+
+    assert result.duration_ms >= 0
+    assert result.completed_at is not None
+    assert result.completed_at >= result.started_at
+
+==================================================
+FILE: ./backend/tests/test_dataset_loader.py
+==================================================
+import pytest
+
+from app.datasets.exceptions import DatasetValidationError
+from app.datasets.loader import DatasetLoader
+from app.datasets.models import Dataset, DatasetSample
+from app.datasets.validator import DatasetValidator
+
+
+def test_load_sample_dataset(sample_dataset_path):
+    dataset = DatasetLoader.load(sample_dataset_path)
+
+    assert dataset.name == "sample_dataset"
+    assert len(dataset) > 0
+    assert all(sample.question for sample in dataset.samples)
+
+
+def test_load_missing_file_raises():
+    with pytest.raises(FileNotFoundError):
+        DatasetLoader.load("does/not/exist.json")
+
+
+def test_load_non_json_raises(tmp_path):
+    bad_file = tmp_path / "dataset.txt"
+    bad_file.write_text("not json")
+
+    with pytest.raises(ValueError):
+        DatasetLoader.load(bad_file)
+
+
+def test_valid_dataset_passes_validation(sample_dataset_path):
+    dataset = DatasetLoader.load(sample_dataset_path)
+    DatasetValidator.validate(dataset)  # should not raise
+
+
+def test_validator_rejects_empty_dataset():
+    with pytest.raises(DatasetValidationError):
+        DatasetValidator.validate(Dataset(name="empty"))
+
+
+def test_validator_rejects_duplicate_questions():
+    dataset = Dataset(
+        name="dupes",
+        samples=[
+            DatasetSample(
+                question="Same question?",
+                contexts=["A fact."],
+                answer="An answer.",
+            ),
+            DatasetSample(
+                question="Same question?",
+                contexts=["A fact."],
+                answer="Another answer.",
+            ),
+        ],
+    )
+
+    with pytest.raises(DatasetValidationError):
+        DatasetValidator.validate(dataset)
+
+
+def test_validator_rejects_empty_contexts():
+    dataset = Dataset(
+        name="no-contexts",
+        samples=[
+            DatasetSample(question="Q?", contexts=[], answer="A."),
+        ],
+    )
+
+    with pytest.raises(DatasetValidationError):
+        DatasetValidator.validate(dataset)
+
+==================================================
+FILE: ./backend/tests/conftest.py
+==================================================
+import os
+import sys
+from pathlib import Path
+
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BACKEND_DIR))
+
+# These must be set before anything imports app.core.config, since
+# Settings() is instantiated at module import time.
+os.environ.setdefault("DATABASE_URL", f"sqlite:///{BACKEND_DIR / 'test_rag_eval.db'}")
+os.environ.setdefault("LLM_PROVIDER", "mock")
+os.environ.setdefault("APP_NAME", "RAG Evaluation Platform (test)")
+os.environ.setdefault("APP_VERSION", "test")
+os.environ.setdefault("REPORTS_DIR", str(BACKEND_DIR / "test_reports"))
+
+import pytest  # noqa: E402
+
+from app.db.base import Base  # noqa: E402
+from app.db.database import SessionLocal, engine  # noqa: E402
+from app.db.session import get_db  # noqa: E402
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _test_schema():
+    """Create a clean schema once for the whole test session."""
+
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+
+    yield
+
+    db_file = BACKEND_DIR / "test_rag_eval.db"
+    if db_file.exists():
+        db_file.unlink()
+
+
+@pytest.fixture()
+def db_session():
+    session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+@pytest.fixture()
+def client():
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    def _override_get_db():
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    app.dependency_overrides[get_db] = _override_get_db
+
+    with TestClient(app) as test_client:
+        yield test_client
+
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture()
+def sample_dataset_path() -> str:
+    return str(BACKEND_DIR / "app" / "datasets" / "sample_dataset.json")
+
+==================================================
+FILE: ./backend/tests/test_run_evaluation.py
+==================================================
+import importlib.util
+import sys
+from pathlib import Path
+
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+SCRIPT_PATH = BACKEND_DIR / "scripts" / "run_evaluation.py"
+
+
+def _load_run_evaluation_module():
+    """
+    Import scripts/run_evaluation.py as a module without needing
+    scripts/ to be a package.
+    """
+
+    spec = importlib.util.spec_from_file_location("run_evaluation_script", SCRIPT_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_pipeline_runs_end_to_end(tmp_path, sample_dataset_path, capsys):
+    run_evaluation = _load_run_evaluation_module()
+
+    reports_dir = tmp_path / "reports"
+
+    exit_code = run_evaluation.main(
+        [
+            "--dataset",
+            sample_dataset_path,
+            "--project",
+            "Integration Test Project",
+            "--experiment",
+            "integration-test-experiment",
+            "--benchmark",
+            "integration-test-benchmark",
+            "--reports-dir",
+            str(reports_dir),
+        ]
+    )
+
+    assert exit_code == 0
+
+    captured = capsys.readouterr()
+    assert "Evaluation Completed" in captured.out
+    assert "Dataset Loaded" in captured.out
+
+    # Reports were written to disk.
+    json_reports = list(reports_dir.glob("benchmark_*.json"))
+    csv_reports = list(reports_dir.glob("benchmark_*.csv"))
+    md_reports = list(reports_dir.glob("benchmark_*.md"))
+
+    assert json_reports, "expected a benchmark_<id>.json report"
+    assert csv_reports, "expected a benchmark_<id>.csv report"
+    assert md_reports, "expected a benchmark_<id>.md report"
+
+    assert (reports_dir / "report.json").exists()
+    assert (reports_dir / "report.csv").exists()
+    assert (reports_dir / "report.md").exists()
+
+
+def test_pipeline_persists_evaluations_and_completes_benchmark(
+    tmp_path, sample_dataset_path, db_session
+):
+    from sqlalchemy import select
+
+    from app.models.benchmark import Benchmark
+    from app.models.evaluation import Evaluation
+    from app.models.experiment import Experiment
+
+    run_evaluation = _load_run_evaluation_module()
+
+    run_evaluation.main(
+        [
+            "--dataset",
+            sample_dataset_path,
+            "--project",
+            "Integration Test Project 2",
+            "--experiment",
+            "integration-test-experiment-2",
+            "--benchmark",
+            "integration-test-benchmark-2",
+            "--reports-dir",
+            str(tmp_path / "reports"),
+        ]
+    )
+
+    experiment = db_session.scalar(
+        select(Experiment).where(Experiment.name == "integration-test-experiment-2")
+    )
+    assert experiment is not None
+
+    benchmark = db_session.scalar(
+        select(Benchmark).where(
+            Benchmark.experiment_id == experiment.id,
+            Benchmark.name == "integration-test-benchmark-2",
+        )
+    )
+    assert benchmark is not None
+    assert benchmark.status == "completed"
+    assert benchmark.completed_at is not None
+
+    evaluations = db_session.scalars(
+        select(Evaluation).where(Evaluation.benchmark_id == benchmark.id)
+    ).all()
+
+    assert len(evaluations) > 0
+    for evaluation in evaluations:
+        assert evaluation.query
+        assert evaluation.answer
+
+
+def test_pipeline_fails_gracefully_on_missing_dataset(tmp_path):
+    run_evaluation = _load_run_evaluation_module()
+
+    exit_code = run_evaluation.main(
+        [
+            "--dataset",
+            str(tmp_path / "does-not-exist.json"),
+            "--reports-dir",
+            str(tmp_path / "reports"),
+        ]
+    )
+
+    assert exit_code == 1
+
+==================================================
+FILE: ./backend/tests/test_metrics.py
+==================================================
+import pytest
+
+from app.evaluation.models import EvaluationRequest
+from app.metrics.correctness import Correctness
+from app.metrics.faithfulness import Faithfulness
+from app.metrics.hit_rate import HitRate
+from app.metrics.map import MAP
+from app.metrics.mrr import MRR
+from app.metrics.ndcg import NDCG
+from app.metrics.precision import PrecisionAtK
+from app.metrics.recall import RecallAtK
+from app.metrics.semantic_similarity import SemanticSimilarity
+
+
+def make_request(**overrides) -> EvaluationRequest:
+    defaults = dict(
+        query="Who created Python?",
+        contexts=[
+            "Python was created by Guido van Rossum.",
+            "JavaScript was created by Brendan Eich.",
+        ],
+        answer="Python was created by Guido van Rossum.",
+        ground_truth="Python was created by Guido van Rossum.",
+        relevant_contexts=["Python was created by Guido van Rossum."],
+    )
+    defaults.update(overrides)
+    return EvaluationRequest(**defaults)
+
+
+class TestPrecisionAtK:
+    def test_half_relevant(self):
+        request = make_request()
+        assert PrecisionAtK(k=2).compute(request) == 0.5
+
+    def test_all_relevant(self):
+        request = make_request(
+            contexts=["A relevant fact.", "Another relevant fact."],
+            relevant_contexts=["A relevant fact.", "Another relevant fact."],
+        )
+        assert PrecisionAtK(k=2).compute(request) == 1.0
+
+    def test_no_contexts_returns_zero(self):
+        request = make_request(contexts=[], relevant_contexts=[])
+        assert PrecisionAtK(k=2).compute(request) == 0.0
+
+
+class TestRecallAtK:
+    def test_full_recall(self):
+        request = make_request()
+        assert RecallAtK(k=2).compute(request) == 1.0
+
+    def test_no_relevant_returns_zero(self):
+        request = make_request(relevant_contexts=[])
+        assert RecallAtK(k=2).compute(request) == 0.0
+
+
+class TestMRR:
+    def test_first_result_relevant(self):
+        request = make_request()
+        assert MRR().compute(request) == 1.0
+
+    def test_second_result_relevant(self):
+        request = make_request(
+            contexts=["Distractor.", "Python was created by Guido van Rossum."],
+        )
+        assert MRR().compute(request) == pytest.approx(0.5)
+
+    def test_no_relevant_returns_zero(self):
+        request = make_request(relevant_contexts=[])
+        assert MRR().compute(request) == 0.0
+
+
+class TestHitRate:
+    def test_hit(self):
+        request = make_request()
+        assert HitRate().compute(request) == 1.0
+
+    def test_miss(self):
+        request = make_request(relevant_contexts=["Something else entirely."])
+        assert HitRate().compute(request) == 0.0
+
+
+class TestMAP:
+    def test_perfect_ranking(self):
+        request = make_request(
+            contexts=["Python was created by Guido van Rossum.", "Distractor."],
+        )
+        assert MAP(k=2).compute(request) == pytest.approx(1.0)
+
+    def test_no_hits_returns_zero(self):
+        request = make_request(relevant_contexts=["Not present anywhere."])
+        assert MAP(k=2).compute(request) == 0.0
+
+
+class TestNDCG:
+    def test_perfect_ranking_is_one(self):
+        request = make_request(
+            contexts=["Python was created by Guido van Rossum.", "Distractor."],
+        )
+        assert NDCG(k=2).compute(request) == pytest.approx(1.0)
+
+    def test_no_relevant_returns_zero(self):
+        request = make_request(relevant_contexts=[])
+        assert NDCG(k=2).compute(request) == 0.0
+
+
+class TestCorrectness:
+    def test_exact_match(self):
+        request = make_request()
+        assert Correctness().compute(request) == 1.0
+
+    def test_mismatch(self):
+        request = make_request(answer="Something completely different.")
+        assert Correctness().compute(request) == 0.0
+
+    def test_no_ground_truth_returns_zero(self):
+        request = make_request(ground_truth=None)
+        assert Correctness().compute(request) == 0.0
+
+
+class TestFaithfulness:
+    def test_grounded_answer_scores_high(self):
+        request = make_request()
+        score = Faithfulness().compute(request)
+        assert 0.5 <= score <= 1.0
+
+    def test_unsupported_answer_scores_low(self):
+        request = make_request(
+            answer="Elephants migrate across the Sahara desert yearly.",
+        )
+        score = Faithfulness().compute(request)
+        assert score < 0.3
+
+    def test_empty_answer_returns_zero(self):
+        request = make_request(answer="")
+        assert Faithfulness().compute(request) == 0.0
+
+
+class TestSemanticSimilarity:
+    def test_identical_strings_score_high(self):
+        request = make_request(
+            answer="Python was created by Guido van Rossum.",
+            ground_truth="Python was created by Guido van Rossum.",
+        )
+        assert SemanticSimilarity().compute(request) >= 0.5
+
+    def test_no_ground_truth_returns_zero(self):
+        request = make_request(ground_truth=None)
+        assert SemanticSimilarity().compute(request) == 0.0
+
+    def test_returns_bounded_score(self):
+        request = make_request(
+            answer="Completely unrelated statement about weather.",
+        )
+        score = SemanticSimilarity().compute(request)
+        assert 0.0 <= score <= 1.0
+
+==================================================
+FILE: ./backend/tests/test_engine.py
+==================================================
+from app.evaluation.engine import EvaluationEngine
+from app.evaluation.models import EvaluationRequest
+
+
+def make_request() -> EvaluationRequest:
+    return EvaluationRequest(
+        query="Who created Python?",
+        contexts=[
+            "Python was created by Guido van Rossum.",
+            "Python was first released in 1991.",
+        ],
+        relevant_contexts=[
+            "Python was created by Guido van Rossum.",
+        ],
+        answer="Python was created by Guido van Rossum.",
+        ground_truth="Python was created by Guido van Rossum.",
+    )
+
+
+def test_engine_runs_every_registered_evaluator():
+    engine = EvaluationEngine()
+    result = engine.evaluate(make_request())
+
+    evaluator_names = {e.evaluator for e in result.evaluators}
+
+    assert evaluator_names == {
+        "RetrievalEvaluator",
+        "GenerationEvaluator",
+        "LLMJudgeEvaluator",
+    }
+
+
+def test_engine_returns_typed_metric_scores():
+    engine = EvaluationEngine()
+    result = engine.evaluate(make_request())
+
+    for evaluator_result in result.evaluators:
+        assert (
+            evaluator_result.metrics
+        ), f"{evaluator_result.evaluator} produced no metrics"
+        for metric in evaluator_result.metrics:
+            assert isinstance(metric.name, str)
+            assert isinstance(metric.score, float)
+
+
+def test_engine_get_helper_finds_evaluator_by_name():
+    engine = EvaluationEngine()
+    result = engine.evaluate(make_request())
+
+    retrieval = result.get("RetrievalEvaluator")
+    assert retrieval is not None
+    assert "precision@2" in retrieval.metric_dict()
+
+==================================================
+FILE: ./backend/tests/test_api.py
+==================================================
+def create_project(client, name="Test Project"):
+    res = client.post("/projects/", params={"name": name, "description": "desc"})
+    assert res.status_code == 201
+    return res.json()
+
+
+def create_dataset(client, project_id, name="Test Dataset"):
+    res = client.post(
+        "/datasets/",
+        params={
+            "project_id": project_id,
+            "name": name,
+            "version": "1.0",
+            "file_path": "app/datasets/sample_dataset.json",
+        },
+    )
+    assert res.status_code == 201
+    return res.json()
+
+
+def create_experiment(client, project_id, name="Test Experiment"):
+    res = client.post(
+        "/experiments/",
+        params={"project_id": project_id, "name": name},
+    )
+    assert res.status_code == 201
+    return res.json()
+
+
+def create_benchmark(client, experiment_id, name="Test Benchmark"):
+    res = client.post(
+        "/benchmarks/",
+        params={"experiment_id": experiment_id, "name": name},
+    )
+    assert res.status_code == 201
+    return res.json()
+
+
+def test_root_returns_app_status(client):
+    res = client.get("/")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "Running"
+
+
+def test_health_check(client):
+    res = client.get("/health")
+    assert res.status_code == 200
+    assert res.json()["status"] == "healthy"
+
+
+def test_project_crud_flow(client):
+    project = create_project(client, "CRUD Project")
+    project_id = project["id"]
+
+    res = client.get(f"/projects/{project_id}")
+    assert res.status_code == 200
+    assert res.json()["name"] == "CRUD Project"
+
+    res = client.put(
+        f"/projects/{project_id}",
+        params={"name": "Renamed Project", "description": "updated"},
+    )
+    assert res.status_code == 200
+    assert res.json()["name"] == "Renamed Project"
+
+    res = client.get("/projects/")
+    assert res.status_code == 200
+    assert any(p["id"] == project_id for p in res.json())
+
+    res = client.delete(f"/projects/{project_id}")
+    assert res.status_code == 200
+
+    res = client.get(f"/projects/{project_id}")
+    assert res.status_code == 404
+
+
+def test_project_not_found(client):
+    res = client.get("/projects/999999")
+    assert res.status_code == 404
+
+
+def test_dataset_and_experiment_creation(client):
+    project = create_project(client, "Pipeline Project")
+    dataset = create_dataset(client, project["id"])
+    experiment = create_experiment(client, project["id"])
+
+    assert dataset["project_id"] == project["id"]
+    assert experiment["project_id"] == project["id"]
+
+    res = client.get("/datasets/")
+    assert any(d["id"] == dataset["id"] for d in res.json())
+
+    res = client.get("/experiments/")
+    assert any(e["id"] == experiment["id"] for e in res.json())
+
+
+def test_benchmark_status_transition(client):
+    project = create_project(client, "Benchmark Project")
+    experiment = create_experiment(client, project["id"])
+    benchmark = create_benchmark(client, experiment["id"])
+
+    assert benchmark["status"] == "pending"
+
+    res = client.patch(
+        f"/benchmarks/{benchmark['id']}/status",
+        params={"status_value": "completed"},
+    )
+    assert res.status_code == 200
+    assert res.json()["status"] == "completed"
+
+    res = client.get(f"/benchmarks/{benchmark['id']}")
+    assert res.json()["status"] == "completed"
+
+
+def test_benchmark_not_found_returns_404(client):
+    res = client.get("/benchmarks/999999")
+    assert res.status_code == 404
+
+
+def test_summary_endpoint_reflects_created_records(client):
+    before = client.get("/summary").json()
+
+    project = create_project(client, "Summary Project")
+    create_dataset(client, project["id"])
+    experiment = create_experiment(client, project["id"])
+    create_benchmark(client, experiment["id"])
+
+    after = client.get("/summary").json()
+
+    assert after["projects"] == before["projects"] + 1
+    assert after["experiments"] == before["experiments"] + 1
+    assert after["benchmarks"] == before["benchmarks"] + 1
+
+
+def test_leaderboard_returns_ranked_list(client):
+    project = create_project(client, "Leaderboard Project")
+    experiment = create_experiment(client, project["id"])
+    create_benchmark(client, experiment["id"], name="Leaderboard Benchmark")
+
+    res = client.get("/leaderboard/")
+    assert res.status_code == 200
+
+    rows = res.json()
+    assert isinstance(rows, list)
+    ranks = [row["rank"] for row in rows]
+    assert ranks == sorted(ranks)
+
+
+def test_benchmark_metrics_endpoint_for_unknown_benchmark(client):
+    res = client.get("/benchmarks/999999/metrics")
+    assert res.status_code == 404
+
+
+def test_report_download_missing_returns_404(client):
+    res = client.get("/reports/999999/json")
+    assert res.status_code == 404
+
+==================================================
+FILE: ./backend/scripts/run_evaluation.py
+==================================================
+#!/usr/bin/env python3
+"""
+End-to-end RAG evaluation pipeline.
+
+Runs the full flow with a single command:
+
+    python scripts/run_evaluation.py
+
+    1. Load the benchmark dataset
+    2. Run every registered evaluator (retrieval, generation, LLM judge)
+    3. Persist Evaluation + Metric rows, update Benchmark status
+    4. Refresh the leaderboard (computed live from the DB)
+    5. Generate JSON / CSV / Markdown reports
+    6. Print a production-style summary to the terminal
+
+See `python scripts/run_evaluation.py --help` for options.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Make `app` importable when run as `python scripts/run_evaluation.py`
+# from the backend/ directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from sqlalchemy import select  # noqa: E402
+from sqlalchemy.orm import Session  # noqa: E402
+
+from app.core.config import settings  # noqa: E402
+from app.datasets.exceptions import DatasetValidationError  # noqa: E402
+from app.datasets.loader import DatasetLoader  # noqa: E402
+from app.datasets.validator import DatasetValidator  # noqa: E402
+from app.db.base import Base  # noqa: E402
+from app.db.database import SessionLocal, engine  # noqa: E402
+from app.experiments.benchmark import BenchmarkRunner  # noqa: E402
+from app.models.benchmark import Benchmark  # noqa: E402
+from app.models.dataset import Dataset as DatasetModel  # noqa: E402
+from app.models.evaluation import Evaluation  # noqa: E402
+from app.models.experiment import Experiment  # noqa: E402
+from app.models.metric import Metric  # noqa: E402
+from app.models.project import Project  # noqa: E402
+from app.reports import CSVReport, JSONReport, MarkdownReport  # noqa: E402
+
+
+# --------------------------------------------------------------------------
+# Terminal styling
+# --------------------------------------------------------------------------
+
+
+class Style:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    CYAN = "\033[36m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    RED = "\033[31m"
+    MAGENTA = "\033[35m"
+
+    @classmethod
+    def enabled(cls) -> bool:
+        return sys.stdout.isatty()
+
+
+def c(text: str, color: str) -> str:
+    if not Style.enabled():
+        return text
+    return f"{color}{text}{Style.RESET}"
+
+
+def header(title: str) -> None:
+    line = "=" * 55
+    print(c(line, Style.CYAN))
+    print(c(title, Style.BOLD))
+    print(c(line, Style.CYAN))
+    print()
+
+
+def row(label: str, value: str, ok: bool | None = None) -> None:
+    mark = ""
+    if ok is True:
+        mark = c(" \u2713", Style.GREEN)
+    elif ok is False:
+        mark = c(" \u2717", Style.RED)
+    print(f"{label:<28}{value}{mark}")
+
+
+def section(title: str) -> None:
+    print()
+    print(c(title, Style.MAGENTA + Style.BOLD))
+    print()
+
+
+def metric_row(name: str, score: float) -> None:
+    bar_len = 24
+    filled = max(0, min(bar_len, round(score * bar_len)))
+    bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
+    print(f"  {name:<22}{c(bar, Style.GREEN)}  {score:.4f}")
+
+
+def progress(current: int, total: int, prefix: str = "Evaluating") -> None:
+    bar_len = 30
+    filled = int(bar_len * current / max(total, 1))
+    bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
+    pct = current / max(total, 1) * 100
+    end = "\n" if current == total else "\r"
+    print(
+        f"{prefix:<12}[{bar}] {current}/{total} ({pct:5.1f}%)",
+        end=end,
+        flush=True,
+    )
+
+
+RETRIEVAL_METRICS = {
+    "precision@2",
+    "recall@2",
+    "mrr",
+    "map@2",
+    "ndcg@2",
+    "hit_rate",
+}
+
+GENERATION_METRICS = {
+    "faithfulness",
+    "correctness",
+    "semantic_similarity",
+}
+
+JUDGE_METRICS = {
+    "llm_faithfulness",
+    "answer_relevance",
+    "hallucination",
+}
+
+
+# --------------------------------------------------------------------------
+# DB helpers (get-or-create)
+# --------------------------------------------------------------------------
+
+
+def get_or_create_project(db: Session, name: str, description: str) -> Project:
+    project = db.scalar(select(Project).where(Project.name == name))
+
+    if project is None:
+        project = Project(name=name, description=description)
+        db.add(project)
+        db.commit()
+        db.refresh(project)
+
+    return project
+
+
+def get_or_create_dataset(
+    db: Session,
+    project: Project,
+    name: str,
+    version: str,
+    file_path: str,
+) -> DatasetModel:
+    dataset = db.scalar(
+        select(DatasetModel).where(
+            DatasetModel.project_id == project.id,
+            DatasetModel.name == name,
+            DatasetModel.version == version,
+        )
+    )
+
+    if dataset is None:
+        dataset = DatasetModel(
+            project_id=project.id,
+            name=name,
+            version=version,
+            file_path=file_path,
+        )
+        db.add(dataset)
+        db.commit()
+        db.refresh(dataset)
+
+    return dataset
+
+
+def get_or_create_experiment(
+    db: Session,
+    project: Project,
+    name: str,
+    description: str,
+) -> Experiment:
+    experiment = db.scalar(
+        select(Experiment).where(
+            Experiment.project_id == project.id,
+            Experiment.name == name,
+        )
+    )
+
+    if experiment is None:
+        experiment = Experiment(
+            project_id=project.id,
+            name=name,
+            description=description,
+        )
+        db.add(experiment)
+        db.commit()
+        db.refresh(experiment)
+
+    return experiment
+
+
+def create_benchmark(db: Session, experiment: Experiment, name: str) -> Benchmark:
+    benchmark = Benchmark(
+        experiment_id=experiment.id,
+        name=name,
+        status="running",
+    )
+    db.add(benchmark)
+    db.commit()
+    db.refresh(benchmark)
+    return benchmark
+
+
+# --------------------------------------------------------------------------
+# Pipeline
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class PipelineArgs:
+    dataset: str
+    project: str
+    experiment: str
+    benchmark: str
+    reports_dir: str
+
+
+def parse_args(argv: list[str] | None = None) -> PipelineArgs:
+    parser = argparse.ArgumentParser(
+        description="Run the full RAG evaluation pipeline end to end.",
+    )
+    parser.add_argument(
+        "--dataset",
+        default="app/datasets/sample_dataset.json",
+        help="Path to a benchmark dataset JSON file.",
+    )
+    parser.add_argument(
+        "--project",
+        default="RAG Evaluation Platform Demo",
+        help="Project name (created if it doesn't exist).",
+    )
+    parser.add_argument(
+        "--experiment",
+        default=(
+            settings.GEMINI_MODEL
+            if settings.LLM_PROVIDER == "gemini"
+            else "gemini-flash"
+        ),
+        help="Experiment / system-under-test name.",
+    )
+    parser.add_argument(
+        "--benchmark",
+        default=None,
+        help="Benchmark run name (default: timestamped).",
+    )
+    parser.add_argument(
+        "--reports-dir",
+        default=settings.REPORTS_DIR,
+        help="Directory to write JSON/CSV/Markdown reports to.",
+    )
+
+    args = parser.parse_args(argv)
+
+    benchmark_name = args.benchmark or (
+        f"benchmark-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+    )
+
+    return PipelineArgs(
+        dataset=args.dataset,
+        project=args.project,
+        experiment=args.experiment,
+        benchmark=benchmark_name,
+        reports_dir=args.reports_dir,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+
+    header("RAG Evaluation Platform")
+
+    # ---------------------------------------------------------------
+    # 0. Ensure tables exist (works with SQLite out of the box; a
+    #    no-op if Alembic has already created the schema, e.g. on
+    #    Postgres).
+    # ---------------------------------------------------------------
+    Base.metadata.create_all(bind=engine)
+
+    db = SessionLocal()
+
+    try:
+        # -------------------------------------------------------
+        # 1. Load + validate dataset
+        # -------------------------------------------------------
+        dataset_path = Path(args.dataset)
+
+        try:
+            dataset = DatasetLoader.load(dataset_path)
+            DatasetValidator.validate(dataset)
+        except (FileNotFoundError, ValueError, DatasetValidationError) as exc:
+            row("Dataset Loaded", str(exc), ok=False)
+            return 1
+
+        row("Dataset Loaded", "", ok=True)
+        row("Questions", str(len(dataset)))
+        print()
+
+        # -------------------------------------------------------
+        # 2. Register project / dataset / experiment / benchmark
+        # -------------------------------------------------------
+        project = get_or_create_project(
+            db,
+            args.project,
+            "Automatically created by run_evaluation.py",
+        )
+
+        get_or_create_dataset(
+            db,
+            project,
+            dataset.name,
+            version="1.0",
+            file_path=str(dataset_path),
+        )
+
+        experiment = get_or_create_experiment(
+            db,
+            project,
+            args.experiment,
+            f"LLM provider: {settings.LLM_PROVIDER}",
+        )
+
+        benchmark = create_benchmark(db, experiment, args.benchmark)
+
+        # -------------------------------------------------------
+        # 3. Run the evaluation engine over every sample
+        # -------------------------------------------------------
+        runner = BenchmarkRunner()
+
+        total = len(dataset)
+        progress(0, total)
+
+        start = time.perf_counter()
+        result = runner.run(dataset)
+        for i in range(1, total + 1):
+            progress(i, total)
+        duration = time.perf_counter() - start
+
+        # -------------------------------------------------------
+        # 4. Persist Evaluation + Metric rows
+        # -------------------------------------------------------
+        for sample, summary in zip(dataset.samples, result.results):
+            evaluation = Evaluation(
+                benchmark_id=benchmark.id,
+                query=sample.question,
+                answer=sample.answer,
+                ground_truth=sample.ground_truth,
+            )
+            db.add(evaluation)
+            db.flush()  # get evaluation.id without a full commit
+
+            for evaluator_result in summary.evaluators:
+                for metric in evaluator_result.metrics:
+                    db.add(
+                        Metric(
+                            evaluation_id=evaluation.id,
+                            name=metric.name,
+                            score=metric.score,
+                        )
+                    )
+
+        benchmark.status = "completed"
+        benchmark.completed_at = datetime.now(timezone.utc)
+        db.commit()
+
+        # -------------------------------------------------------
+        # 5. Print grouped metric summaries
+        # -------------------------------------------------------
+        section("Running Retrieval Metrics...")
+        for name, score in sorted(result.average_scores.items()):
+            if name in RETRIEVAL_METRICS:
+                metric_row(name, score)
+
+        section("Running Generation Metrics...")
+        for name, score in sorted(result.average_scores.items()):
+            if name in GENERATION_METRICS:
+                metric_row(name, score)
+
+        judge_only = JUDGE_METRICS - GENERATION_METRICS
+        judge_present = {
+            name: score
+            for name, score in result.average_scores.items()
+            if name in judge_only
+        }
+        if judge_present:
+            section("Running LLM-Judge Metrics...")
+            for name, score in sorted(judge_present.items()):
+                metric_row(name, score)
+
+        # -------------------------------------------------------
+        # 6. Generate reports
+        # -------------------------------------------------------
+        section("Saving Results...")
+
+        reports_dir = Path(args.reports_dir)
+
+        json_path = reports_dir / f"benchmark_{benchmark.id}.json"
+        csv_path = reports_dir / f"benchmark_{benchmark.id}.csv"
+        md_path = reports_dir / f"benchmark_{benchmark.id}.md"
+
+        result.benchmark_id = str(benchmark.id)
+
+        JSONReport().generate(result, json_path)
+        CSVReport().generate(result, csv_path)
+        MarkdownReport().generate(result, md_path)
+
+        # Also write the "latest run" under stable, predictable names.
+        JSONReport().generate(result, reports_dir / "report.json")
+        CSVReport().generate(result, reports_dir / "report.csv")
+        MarkdownReport().generate(result, reports_dir / "report.md")
+
+        row("Leaderboard Updated", "", ok=True)
+        row("Reports Generated", "", ok=True)
+
+        # -------------------------------------------------------
+        # 7. Final summary
+        # -------------------------------------------------------
+        overall_score = (
+            round(
+                sum(result.average_scores.values()) / len(result.average_scores),
+                4,
+            )
+            if result.average_scores
+            else 0.0
+        )
+
+        header("Evaluation Completed")
+
+        row("Benchmark", f"#{benchmark.id} ({benchmark.name})")
+        row("Experiment", experiment.name)
+        row("Duration", f"{duration:.2f}s")
+        row(
+            "Successful / Failed",
+            f"{result.successful_samples} / {result.failed_samples}",
+        )
+        row("Overall Average Score", f"{overall_score:.4f}")
+        print()
+        row("JSON Report", str(json_path))
+        row("CSV Report", str(csv_path))
+        row("Markdown Report", str(md_path))
+        print()
+        print(c("API docs:      http://localhost:8000/docs", Style.DIM))
+        print(c("Dashboard:     http://localhost:5500", Style.DIM))
+        print()
+
+        return 0
+
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+==================================================
+FILE: ./backend/docker-entrypoint.sh
+==================================================
+#!/bin/sh
+set -e
+
+# --- Wait for Postgres (skip entirely for SQLite) ---
+if [ -n "$DATABASE_URL" ] && echo "$DATABASE_URL" | grep -q '^postgresql'; then
+  echo "Waiting for Postgres..."
+  python <<'PYEOF'
+import os
+import sys
+import time
+
+import sqlalchemy
+
+url = os.environ["DATABASE_URL"]
+deadline = time.time() + 60
+
+while time.time() < deadline:
+    try:
+        engine = sqlalchemy.create_engine(url)
+        with engine.connect():
+            print("Postgres is ready.")
+            sys.exit(0)
+    except Exception:
+        time.sleep(1)
+
+print("Postgres did not become ready in time.", file=sys.stderr)
+sys.exit(1)
+PYEOF
+fi
+
+# --- Apply migrations ---
+echo "Running database migrations..."
+alembic upgrade head
+
+# --- Optionally seed demo data on first boot ---
+if [ "${SEED_ON_START:-true}" = "true" ]; then
+  echo "Seeding demo benchmark (SEED_ON_START=true)..."
+  python scripts/run_evaluation.py --experiment "${SEED_EXPERIMENT_NAME:-gemini-flash}" || true
+fi
+
+echo "Starting: $@"
+exec "$@"
+
+==================================================
+FILE: ./backend/pytest.ini
+==================================================
+[pytest]
+testpaths = tests
+pythonpath = .
+filterwarnings =
+    ignore::DeprecationWarning
+
+==================================================
+FILE: ./frontend/style.css
+==================================================
+/* ---------------------------------------------------------------
+   RAG Evaluation Platform — dashboard tokens
+   Ink-navy ground, three evaluator accents (retrieval / generation
+   / judge), monospace for every number so scores read like a
+   scoreboard rather than marketing copy.
+----------------------------------------------------------------*/
+
+:root {
+  --bg: #0a0d13;
+  --bg-raised: #10141c;
+  --bg-panel: #12161f;
+  --bg-inset: #0d1119;
+  --border: #212734;
+  --border-soft: #1a1f2b;
+
+  --text: #e7ebf3;
+  --text-dim: #8891a3;
+  --text-faint: #565f72;
+
+  --amber: #f5a524;      /* retrieval */
+  --amber-dim: #7a5a1e;
+  --teal: #35d0b8;       /* generation */
+  --teal-dim: #1c6d61;
+  --violet: #9b8cff;     /* llm judge */
+  --violet-dim: #4f4790;
+
+  --good: #4ade80;
+  --warn: #f5a524;
+  --bad: #f0556a;
+
+  --radius: 10px;
+  --font-ui: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'JetBrains Mono', 'SFMono-Regular', Menlo, monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  background-image:
+    radial-gradient(ellipse 900px 500px at 15% -10%, rgba(245, 165, 36, 0.07), transparent),
+    radial-gradient(ellipse 900px 500px at 85% 0%, rgba(53, 208, 184, 0.06), transparent);
+  background-repeat: no-repeat;
+}
+
+.app {
+  max-width: 1360px;
+  margin: 0 auto;
+  padding: 0 28px 48px;
+}
+
+a { color: inherit; }
+
+/* ---------------- Top bar ---------------- */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 22px 0 20px;
+  border-bottom: 1px solid var(--border-soft);
+  margin-bottom: 26px;
+  flex-wrap: wrap;
+}
+
+.brand { display: flex; align-items: center; gap: 12px; }
+
+.brand-mark {
+  color: var(--amber);
+  font-size: 18px;
+  line-height: 1;
+  transform: rotate(45deg);
+  display: inline-block;
+}
+
+.brand-text h1 {
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+.brand-sub {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.api-base {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.api-base input {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  width: 190px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.api-base input:focus {
+  outline: none;
+  border-color: var(--amber-dim);
+  color: var(--text);
+}
+
+.status-pill {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-raised);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.status-pill .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.status-pending .dot { background: var(--warn); animation: pulse 1.4s infinite; }
+.status-ok .dot { background: var(--good); }
+.status-error .dot { background: var(--bad); }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 7px 12px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg-raised);
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color .15s ease, color .15s ease, background .15s ease;
+  text-decoration: none;
+}
+
+.btn:hover { border-color: var(--amber-dim); color: var(--amber); }
+
+.btn-ghost { background: transparent; }
+
+.btn-outline {
+  background: var(--bg-inset);
+  font-size: 11.5px;
+  padding: 6px 10px;
+}
+
+.auto-refresh {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+  user-select: none;
+}
+
+/* ---------------- Stat rail ---------------- */
+
+.stat-rail {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 12px;
+  margin-bottom: 22px;
+}
+
+.stat-card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  padding: 16px 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.stat-card--accent {
+  border-color: var(--amber-dim);
+  background: linear-gradient(155deg, rgba(245,165,36,0.10), var(--bg-panel) 60%);
+}
+
+.stat-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-faint);
+}
+
+.stat-value {
+  font-family: var(--font-mono);
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.stat-card--accent .stat-value { color: var(--amber); }
+
+/* ---------------- Layout grid ---------------- */
+
+.grid-2 {
+  display: grid;
+  grid-template-columns: 1.15fr 0.85fr;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  padding: 18px 20px 20px;
+}
+
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.panel-head--wrap { flex-wrap: wrap; row-gap: 10px; }
+
+.panel-head h2 {
+  font-size: 14px;
+  font-weight: 700;
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+.panel-sub {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+}
+
+.legend {
+  display: flex;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.legend span { display: flex; align-items: center; gap: 5px; }
+
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.dot--retrieval { background: var(--amber); }
+.dot--generation { background: var(--teal); }
+.dot--judge { background: var(--violet); }
+
+/* ---------------- Tables ---------------- */
+
+.table-wrap { overflow-x: auto; }
+.table-wrap--scroll { max-height: 360px; overflow-y: auto; }
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.data-table thead th {
+  text-align: left;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+  font-weight: 600;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  position: sticky;
+  top: 0;
+  background: var(--bg-panel);
+}
+
+.data-table tbody td {
+  padding: 10px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  color: var(--text);
+  vertical-align: top;
+}
+
+.data-table tbody tr:last-child td { border-bottom: none; }
+.data-table tbody tr:hover td { background: rgba(255,255,255,0.015); }
+
+.data-table--compact td { font-size: 12.5px; }
+
+.empty-row td {
+  color: var(--text-faint);
+  text-align: center;
+  padding: 26px 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.rank-cell { font-family: var(--font-mono); color: var(--text-dim); }
+.rank-cell--top { color: var(--amber); font-weight: 700; }
+
+.score-cell { font-family: var(--font-mono); font-weight: 600; }
+
+.mono { font-family: var(--font-mono); }
+
+.badge {
+  display: inline-block;
+  font-size: 10.5px;
+  font-family: var(--font-mono);
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  text-transform: lowercase;
+}
+
+.badge--completed { color: var(--good); border-color: var(--teal-dim); }
+.badge--running { color: var(--warn); border-color: var(--amber-dim); }
+.badge--pending { color: var(--text-dim); }
+.badge--failed { color: var(--bad); border-color: #6d2632; }
+
+.cell-truncate {
+  max-width: 260px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.metric-chip {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.metric-chip--good { color: var(--good); }
+.metric-chip--warn { color: var(--warn); }
+.metric-chip--bad { color: var(--bad); }
+
+/* ---------------- Terminal panel (signature) ---------------- */
+
+.panel--terminal { display: flex; flex-direction: column; }
+
+.terminal {
+  background: var(--bg-inset);
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  padding: 14px 16px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.65;
+  flex: 1;
+  min-height: 260px;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.terminal-line { white-space: pre-wrap; word-break: break-word; }
+.terminal-line.dim { color: var(--text-faint); }
+.terminal-line.ok { color: var(--good); }
+.terminal-line.head { color: var(--text); font-weight: 700; }
+.terminal-line.retrieval { color: var(--amber); }
+.terminal-line.generation { color: var(--teal); }
+.terminal-line.judge { color: var(--violet); }
+
+/* ---------------- Charts ---------------- */
+
+.chart-box { position: relative; height: 260px; }
+.chart-box--small { height: 240px; }
+
+/* ---------------- Detail panel ---------------- */
+
+.panel--detail { margin-top: 4px; }
+
+.detail-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.detail-controls select {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--bg-inset);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 7px 10px;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: 0.9fr 1.4fr;
+  gap: 18px;
+}
+
+/* ---------------- Footer ---------------- */
+
+.app-footer {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-faint);
+  padding-top: 18px;
+  font-family: var(--font-mono);
+}
+
+/* ---------------- Responsive ---------------- */
+
+@media (max-width: 1080px) {
+  .stat-rail { grid-template-columns: repeat(3, 1fr); }
+  .grid-2 { grid-template-columns: 1fr; }
+  .detail-grid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 560px) {
+  .stat-rail { grid-template-columns: repeat(2, 1fr); }
+  .topbar { flex-direction: column; align-items: flex-start; }
+}
+
+/* ---------------- Scrollbars ---------------- */
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-faint); }
+
+==================================================
+FILE: ./frontend/Dockerfile
+==================================================
+FROM nginx:alpine
+
+COPY . /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
+
+==================================================
+FILE: ./frontend/index.html
+==================================================
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RAG Evaluation Platform &middot; Dashboard</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+<link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ============ Top bar ============ -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">&#9632;</span>
+      <div class="brand-text">
+        <h1>RAG Evaluation Platform</h1>
+        <p class="brand-sub">Retrieval &amp; generation quality, benchmarked</p>
+      </div>
+    </div>
+
+    <div class="topbar-right">
+      <label class="api-base">
+        <span>API</span>
+        <input id="apiBaseInput" type="text" spellcheck="false" value="http://127.0.0.1:8000">
+      </label>
+      <div id="apiStatus" class="status-pill status-pending">
+        <span class="dot"></span>
+        <span class="status-label">connecting&hellip;</span>
+      </div>
+      <button id="refreshBtn" class="btn btn-ghost" title="Refresh now">
+        <svg viewBox="0 0 24 24" width="15" height="15"><path fill="currentColor" d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46A7.93 7.93 0 0 0 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74A7.93 7.93 0 0 0 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/></svg>
+        Refresh
+      </button>
+      <label class="auto-refresh">
+        <input id="autoRefresh" type="checkbox" checked>
+        Auto
+      </label>
+    </div>
+  </header>
+
+  <main class="content">
+
+    <!-- ============ Overview stat rail ============ -->
+    <section class="stat-rail" aria-label="Overview">
+      <div class="stat-card">
+        <span class="stat-label">Projects</span>
+        <span class="stat-value" id="statProjects">&mdash;</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Datasets</span>
+        <span class="stat-value" id="statDatasets">&mdash;</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Experiments</span>
+        <span class="stat-value" id="statExperiments">&mdash;</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Benchmarks</span>
+        <span class="stat-value" id="statBenchmarks">&mdash;</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Evaluations</span>
+        <span class="stat-value" id="statEvaluations">&mdash;</span>
+      </div>
+      <div class="stat-card stat-card--accent">
+        <span class="stat-label">Average Score</span>
+        <span class="stat-value" id="statAverage">&mdash;</span>
+      </div>
+    </section>
+
+    <div class="grid-2">
+
+      <!-- ============ Leaderboard ============ -->
+      <section class="panel panel--leaderboard">
+        <div class="panel-head">
+          <h2>Leaderboard</h2>
+          <span class="panel-sub">Ranked by overall average score</span>
+        </div>
+
+        <div class="table-wrap">
+          <table class="data-table" id="leaderboardTable">
+            <thead>
+              <tr>
+                <th>Rank</th>
+                <th>Experiment</th>
+                <th>Benchmark</th>
+                <th>Status</th>
+                <th>Evals</th>
+                <th>Score</th>
+              </tr>
+            </thead>
+            <tbody id="leaderboardBody">
+              <tr class="empty-row"><td colspan="6">Waiting for data&hellip;</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ============ Terminal feed (signature element) ============ -->
+      <section class="panel panel--terminal">
+        <div class="panel-head">
+          <h2>Pipeline Run</h2>
+          <span class="panel-sub">python scripts/run_evaluation.py</span>
+        </div>
+        <div class="terminal" id="terminalFeed">
+          <div class="terminal-line dim">$ python scripts/run_evaluation.py</div>
+          <div class="terminal-line dim">Waiting for the latest run&hellip;</div>
+        </div>
+      </section>
+
+    </div>
+
+    <div class="grid-2">
+
+      <!-- ============ Run comparison ============ -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Run Comparison</h2>
+          <span class="panel-sub">Overall score across every benchmark run</span>
+        </div>
+        <div class="chart-box">
+          <canvas id="comparisonChart"></canvas>
+        </div>
+      </section>
+
+      <!-- ============ Metric breakdown ============ -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Metric Breakdown</h2>
+          <div class="legend">
+            <span><i class="dot dot--retrieval"></i>Retrieval</span>
+            <span><i class="dot dot--generation"></i>Generation</span>
+            <span><i class="dot dot--judge"></i>LLM Judge</span>
+          </div>
+        </div>
+        <div class="chart-box">
+          <canvas id="metricChart"></canvas>
+        </div>
+      </section>
+
+    </div>
+
+    <!-- ============ Benchmark detail / drill-down ============ -->
+    <section class="panel panel--detail">
+      <div class="panel-head panel-head--wrap">
+        <div>
+          <h2>Benchmark Detail</h2>
+          <span class="panel-sub">Inspect one run, compare metrics, download reports</span>
+        </div>
+        <div class="detail-controls">
+          <select id="benchmarkSelect"></select>
+          <a id="downloadJson" class="btn btn-outline" href="#" target="_blank">JSON</a>
+          <a id="downloadCsv" class="btn btn-outline" href="#" target="_blank">CSV</a>
+          <a id="downloadMd" class="btn btn-outline" href="#" target="_blank">Markdown</a>
+        </div>
+      </div>
+
+      <div class="detail-grid">
+        <div class="chart-box chart-box--small">
+          <canvas id="detailChart"></canvas>
+        </div>
+
+        <div class="table-wrap table-wrap--scroll">
+          <table class="data-table data-table--compact" id="samplesTable">
+            <thead>
+              <tr>
+                <th>Question</th>
+                <th>Answer</th>
+                <th>Faithfulness</th>
+                <th>Correctness</th>
+                <th>Semantic&nbsp;Sim.</th>
+              </tr>
+            </thead>
+            <tbody id="samplesBody">
+              <tr class="empty-row"><td colspan="5">Select a benchmark above.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="app-footer">
+    <span>RAG Evaluation Platform</span>
+    <span class="dim" id="lastUpdated">never updated</span>
+  </footer>
+
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
+
+==================================================
+FILE: ./frontend/app.js
+==================================================
+/* ---------------------------------------------------------------
+   RAG Evaluation Platform — dashboard
+   Talks to the FastAPI backend (app/main.py). All state is fetched
+   live; no build step, no framework.
+----------------------------------------------------------------*/
+
+const METRIC_GROUPS = {
+  retrieval: ["precision@2", "recall@2", "mrr", "map@2", "ndcg@2", "hit_rate"],
+  generation: ["faithfulness", "correctness", "semantic_similarity"],
+  judge: ["llm_faithfulness", "answer_relevance", "hallucination"],
+};
+
+const GROUP_COLOR = {
+  retrieval: "#f5a524",
+  generation: "#35d0b8",
+  judge: "#9b8cff",
+};
+
+const LOWER_IS_BETTER = new Set(["hallucination"]);
+
+function metricGroup(name) {
+  for (const [group, names] of Object.entries(METRIC_GROUPS)) {
+    if (names.includes(name)) return group;
+  }
+  return "generation";
+}
+
+function scoreClass(name, value) {
+  const good = LOWER_IS_BETTER.has(name) ? value <= 0.25 : value >= 0.75;
+  const bad = LOWER_IS_BETTER.has(name) ? value >= 0.6 : value < 0.4;
+  if (good) return "metric-chip--good";
+  if (bad) return "metric-chip--bad";
+  return "metric-chip--warn";
+}
+
+function fmtScore(value) {
+  if (value === null || value === undefined || Number.isNaN(value)) return "\u2014";
+  return Number(value).toFixed(4);
+}
+
+function fmtPct(value) {
+  if (value === null || value === undefined) return "\u2014";
+  return `${Math.round(value * 100)}%`;
+}
+
+// ---------------- State ----------------
+
+const state = {
+  apiBase: localStorage.getItem("ragEvalApiBase") || "http://127.0.0.1:8000",
+  benchmarks: [],
+  selectedBenchmarkId: null,
+  charts: {},
+  timer: null,
+};
+
+const el = (id) => document.getElementById(id);
+
+// ---------------- Networking ----------------
+
+async function apiGet(path) {
+  const url = `${state.apiBase.replace(/\/$/, "")}${path}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText} — ${path}`);
+  return res.json();
+}
+
+function setStatus(mode, label) {
+  const pill = el("apiStatus");
+  pill.className = `status-pill status-${mode}`;
+  pill.querySelector(".status-label").textContent = label;
+}
+
+// ---------------- Renderers ----------------
+
+function renderStats(summary) {
+  el("statProjects").textContent = summary.projects;
+  el("statDatasets").textContent = summary.datasets;
+  el("statExperiments").textContent = summary.experiments;
+  el("statBenchmarks").textContent = summary.benchmarks;
+  el("statEvaluations").textContent = summary.evaluations;
+  el("statAverage").textContent = fmtScore(summary.average_score);
+}
+
+function renderLeaderboard(rows) {
+  const body = el("leaderboardBody");
+
+  if (!rows.length) {
+    body.innerHTML = `<tr class="empty-row"><td colspan="6">No benchmark runs yet. Run: python scripts/run_evaluation.py</td></tr>`;
+    return;
+  }
+
+  body.innerHTML = rows
+    .map((r) => {
+      const rankClass = r.rank === 1 ? "rank-cell rank-cell--top" : "rank-cell";
+      const rankLabel = r.rank === 1 ? `#1` : `#${r.rank}`;
+      return `
+        <tr>
+          <td class="${rankClass}">${rankLabel}</td>
+          <td>${escapeHtml(r.experiment)}</td>
+          <td class="mono">${escapeHtml(r.benchmark)}</td>
+          <td><span class="badge badge--${r.status}">${escapeHtml(r.status)}</span></td>
+          <td class="mono">${r.evaluations}</td>
+          <td class="score-cell">${fmtScore(r.overall_score)}</td>
+        </tr>`;
+    })
+    .join("");
+}
+
+function renderComparisonChart(rows) {
+  const ctx = el("comparisonChart");
+  const labels = rows.map((r) => `${r.experiment} · ${r.benchmark.replace("benchmark-", "")}`);
+  const data = rows.map((r) => r.overall_score);
+
+  if (state.charts.comparison) state.charts.comparison.destroy();
+
+  state.charts.comparison = new Chart(ctx, {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [
+        {
+          label: "Overall score",
+          data,
+          backgroundColor: "#f5a52488",
+          borderColor: "#f5a524",
+          borderWidth: 1.5,
+          borderRadius: 4,
+          maxBarThickness: 34,
+        },
+      ],
+    },
+    options: baseChartOptions({ max: 1 }),
+  });
+}
+
+function renderMetricChart(metricAverages) {
+  const ctx = el("metricChart");
+  const names = Object.keys(metricAverages);
+  const colors = names.map((n) => GROUP_COLOR[metricGroup(n)]);
+
+  if (state.charts.metric) state.charts.metric.destroy();
+
+  state.charts.metric = new Chart(ctx, {
+    type: "bar",
+    data: {
+      labels: names,
+      datasets: [
+        {
+          label: "Average score",
+          data: names.map((n) => metricAverages[n]),
+          backgroundColor: colors.map((c) => c + "aa"),
+          borderColor: colors,
+          borderWidth: 1.5,
+          borderRadius: 4,
+          maxBarThickness: 28,
+        },
+      ],
+    },
+    options: baseChartOptions({ max: 1, indexAxis: "y" }),
+  });
+}
+
+function renderDetailChart(metrics) {
+  const ctx = el("detailChart");
+  const names = Object.keys(metrics);
+  const colors = names.map((n) => GROUP_COLOR[metricGroup(n)]);
+
+  if (state.charts.detail) state.charts.detail.destroy();
+
+  state.charts.detail = new Chart(ctx, {
+    type: "radar",
+    data: {
+      labels: names,
+      datasets: [
+        {
+          label: "Score",
+          data: names.map((n) => metrics[n]),
+          backgroundColor: "#35d0b833",
+          borderColor: "#35d0b8",
+          pointBackgroundColor: colors,
+          pointBorderColor: colors,
+          borderWidth: 2,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        r: {
+          min: 0,
+          max: 1,
+          ticks: { display: false },
+          grid: { color: "#212734" },
+          angleLines: { color: "#212734" },
+          pointLabels: { color: "#8891a3", font: { family: "JetBrains Mono", size: 10.5 } },
+        },
+      },
+      plugins: { legend: { display: false } },
+    },
+  });
+}
+
+function baseChartOptions({ max = 1, indexAxis = "x" } = {}) {
+  const valueAxis = { min: 0, max, grid: { color: "#1a1f2b" }, ticks: { color: "#565f72", font: { family: "JetBrains Mono", size: 10.5 } } };
+  const labelAxis = { grid: { display: false }, ticks: { color: "#8891a3", font: { family: "Inter", size: 11 } } };
+
+  return {
+    indexAxis,
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: { legend: { display: false } },
+    scales:
+      indexAxis === "y"
+        ? { x: valueAxis, y: labelAxis }
+        : { y: valueAxis, x: labelAxis },
+  };
+}
+
+function renderSamples(rows) {
+  const body = el("samplesBody");
+
+  if (!rows.length) {
+    body.innerHTML = `<tr class="empty-row"><td colspan="5">No evaluations for this benchmark.</td></tr>`;
+    return;
+  }
+
+  body.innerHTML = rows
+    .map((r) => {
+      const m = r.metrics || {};
+      const chip = (name) =>
+        name in m
+          ? `<span class="metric-chip ${scoreClass(name, m[name])}">${fmtScore(m[name])}</span>`
+          : `<span class="metric-chip">\u2014</span>`;
+
+      return `
+        <tr>
+          <td class="cell-truncate" title="${escapeHtml(r.query)}">${escapeHtml(r.query)}</td>
+          <td class="cell-truncate" title="${escapeHtml(r.answer)}">${escapeHtml(r.answer)}</td>
+          <td>${chip("faithfulness")}</td>
+          <td>${chip("correctness")}</td>
+          <td>${chip("semantic_similarity")}</td>
+        </tr>`;
+    })
+    .join("");
+}
+
+function renderTerminalFeed(latest, metrics) {
+  const feed = el("terminalFeed");
+  if (!latest) {
+    feed.innerHTML = `<div class="terminal-line dim">$ python scripts/run_evaluation.py</div><div class="terminal-line dim">No runs yet.</div>`;
+    return;
+  }
+
+  const lines = [
+    `<div class="terminal-line dim">$ python scripts/run_evaluation.py</div>`,
+    `<div class="terminal-line head">Benchmark #${latest.id} &middot; ${escapeHtml(latest.name)}</div>`,
+    `<div class="terminal-line ok">Dataset Loaded &check;</div>`,
+    `<div class="terminal-line ok">Status: ${escapeHtml(latest.status)}</div>`,
+  ];
+
+  if (metrics && metrics.metrics) {
+    lines.push(`<div class="terminal-line dim"></div>`);
+    lines.push(`<div class="terminal-line retrieval">Running Retrieval Metrics...</div>`);
+    METRIC_GROUPS.retrieval.forEach((n) => {
+      if (n in metrics.metrics) lines.push(termLine(n, metrics.metrics[n]));
+    });
+    lines.push(`<div class="terminal-line dim"></div>`);
+    lines.push(`<div class="terminal-line generation">Running Generation Metrics...</div>`);
+    METRIC_GROUPS.generation.forEach((n) => {
+      if (n in metrics.metrics) lines.push(termLine(n, metrics.metrics[n]));
+    });
+    lines.push(`<div class="terminal-line dim"></div>`);
+    lines.push(`<div class="terminal-line judge">Running LLM-Judge Metrics...</div>`);
+    METRIC_GROUPS.judge.forEach((n) => {
+      if (n in metrics.metrics) lines.push(termLine(n, metrics.metrics[n]));
+    });
+  }
+
+  lines.push(`<div class="terminal-line dim"></div>`);
+  lines.push(`<div class="terminal-line ok">Leaderboard Updated &check;</div>`);
+  lines.push(`<div class="terminal-line ok">Reports Generated &check;</div>`);
+
+  feed.innerHTML = lines.join("");
+  feed.scrollTop = 0;
+}
+
+function termLine(name, value) {
+  return `<div class="terminal-line">  ${name.padEnd(20, "\u00a0")}${fmtScore(value)}</div>`;
+}
+
+function escapeHtml(str) {
+  if (str === null || str === undefined) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// ---------------- Detail (drill-down) ----------------
+
+function populateBenchmarkSelect(benchmarks) {
+  const select = el("benchmarkSelect");
+  const previous = state.selectedBenchmarkId;
+
+  select.innerHTML = benchmarks
+    .map((b) => `<option value="${b.id}">#${b.id} · ${b.name}</option>`)
+    .join("");
+
+  const stillExists = benchmarks.some((b) => b.id === previous);
+  state.selectedBenchmarkId = stillExists ? previous : benchmarks[0]?.id ?? null;
+
+  if (state.selectedBenchmarkId !== null) {
+    select.value = String(state.selectedBenchmarkId);
+  }
+}
+
+function setDownloadLinks(id) {
+  const base = state.apiBase.replace(/\/$/, "");
+  el("downloadJson").href = `${base}/reports/${id}/json`;
+  el("downloadCsv").href = `${base}/reports/${id}/csv`;
+  el("downloadMd").href = `${base}/reports/${id}/markdown`;
+}
+
+async function loadDetail(id) {
+  if (id === null || id === undefined) return;
+
+  setDownloadLinks(id);
+
+  try {
+    const [metrics, samples] = await Promise.all([
+      apiGet(`/benchmarks/${id}/metrics`),
+      apiGet(`/benchmarks/${id}/evaluations?limit=50`),
+    ]);
+
+    renderDetailChart(metrics.metrics);
+    renderSamples(samples);
+
+    return metrics;
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+// ---------------- Main load cycle ----------------
+
+async function loadAll() {
+  try {
+    const [summary, leaderboard, benchmarks] = await Promise.all([
+      apiGet("/summary"),
+      apiGet("/leaderboard/"),
+      apiGet("/benchmarks/"),
+    ]);
+
+    setStatus("ok", "connected");
+
+    renderStats(summary);
+    renderLeaderboard(leaderboard);
+    renderComparisonChart(leaderboard);
+    renderMetricChart(summary.metric_averages);
+
+    const sortedBenchmarks = [...benchmarks].sort((a, b) => b.id - a.id);
+    populateBenchmarkSelect(sortedBenchmarks);
+
+    const detailMetrics = await loadDetail(state.selectedBenchmarkId);
+    renderTerminalFeed(summary.latest_benchmark, detailMetrics);
+
+    el("lastUpdated").textContent = `updated ${new Date().toLocaleTimeString()}`;
+  } catch (err) {
+    console.error(err);
+    setStatus("error", "unreachable");
+  }
+}
+
+// ---------------- Wiring ----------------
+
+function scheduleAutoRefresh() {
+  if (state.timer) clearInterval(state.timer);
+  if (el("autoRefresh").checked) {
+    state.timer = setInterval(loadAll, 8000);
+  }
+}
+
+function init() {
+  el("apiBaseInput").value = state.apiBase;
+
+  el("apiBaseInput").addEventListener("change", (e) => {
+    state.apiBase = e.target.value.trim() || state.apiBase;
+    localStorage.setItem("ragEvalApiBase", state.apiBase);
+    loadAll();
+  });
+
+  el("refreshBtn").addEventListener("click", loadAll);
+  el("autoRefresh").addEventListener("change", scheduleAutoRefresh);
+
+  el("benchmarkSelect").addEventListener("change", async (e) => {
+    state.selectedBenchmarkId = Number(e.target.value);
+    await loadDetail(state.selectedBenchmarkId);
+  });
+
+  loadAll();
+  scheduleAutoRefresh();
+}
+
+init();
+
+==================================================
+FILE: ./Makefile
+==================================================
+include .env
+export
+
+.PHONY: up down clean run run-gemini logs ps rebuild
+
+up:
+	docker compose up --build -d
+
+upf:
+	docker compose up --build
+
+down:
+	docker compose down --remove-orphans
+
+clean:
+	docker compose down --remove-orphans -v
+
+rebuild:
+	docker compose build --no-cache
+
+EXP ?= gemini-flash
+run:
+	docker compose exec backend python scripts/run_evaluation.py --experiment "$(EXP)"
+
+run-gemini:
+	docker compose exec -e LLM_PROVIDER=gemini -e GEMINI_API_KEY=$(KEY) backend \
+		python scripts/run_evaluation.py --experiment "$(EXP)"
+
+run-gemini-auto:
+	docker compose exec -e LLM_PROVIDER=gemini -e GEMINI_API_KEY=$${GEMINI_API_KEY} backend \
+		python scripts/run_evaluation.py --experiment "$(EXP)"
+
+logs:
+	docker compose logs -f
+
+ps:
+	docker compose ps
+
